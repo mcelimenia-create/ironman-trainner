@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-telegram-bot==20.7
+anthropic
+sqlalchemy
+asyncpg
+psycopg2-binary
+python-dotenv
+httpx
