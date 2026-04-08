@@ -158,7 +158,7 @@ async def ask_coach(db: Session, user_id: str, user_message: str) -> str:
         system += f"\n\nCONTEXTO ACTUAL DEL ATLETA:{context}"
 
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-5",
         max_tokens=1000,
         system=system,
         messages=messages
