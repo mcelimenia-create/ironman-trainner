@@ -120,15 +120,15 @@ async def strava_callback(user_id: str, code: str = None, error: str = None):
 # ─── STRAVA WEBHOOK ───────────────────────────────────────────────────────────
 
 @app.get("/strava/webhook")
-async def strava_webhook_verify(
-    hub_mode: str = None,
-    hub_verify_token: str = None,
-    hub_challenge: str = None
-):
-    """Verificación del webhook por parte de Strava."""
-    if hub_mode == "subscribe" and hub_verify_token == STRAVA_VERIFY_TOKEN:
-        return {"hub.challenge": hub_challenge}
-    return {"error": "Token inválido"}, 403
+async def strava_webhook_verify(request: Request):
+    params = dict(request.query_params)
+    mode = params.get("hub.mode")
+    verify_token = params.get("hub.verify_token")
+    challenge = params.get("hub.challenge")
+
+    if mode == "subscribe" and verify_token == STRAVA_VERIFY_TOKEN:
+        return {"hub.challenge": challenge}
+    return {"error": "Token inválido"}
 
 
 @app.post("/strava/webhook")
