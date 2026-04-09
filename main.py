@@ -1,9 +1,12 @@
 import os
 import httpx
-from fastapi import FastAPI, Request
+from openai import AsyncOpenAI
+from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import RedirectResponse
 from database import init_db, SessionLocal
 from coach import ask_coach
+
+openai_client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
 from strava import (
     STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, STRAVA_VERIFY_TOKEN,
     exchange_code, get_activity_detail, save_strava_token,
@@ -18,10 +21,27 @@ BASE_URL = os.environ.get("BASE_URL", "https://ironman-trainner-production.up.ra
 # Mapeo telegram_user_id → strava_athlete_id (en memoria, suficiente para uso personal)
 strava_user_map = {}
 
+# Set de activity_ids ya procesados para evitar duplicados
+processed_activities: set = set()
+
 
 @app.on_event("startup")
 def startup():
     init_db()
+
+
+async def transcribe_voice(file_id: str) -> str:
+    """Descarga el audio de Telegram y lo transcribe con Whisper."""
+    async with httpx.AsyncClient() as client:
+        r = await client.get(f"{TELEGRAM_API}/getFile?file_id={file_id}")
+        file_path = r.json()["result"]["file_path"]
+        audio = await client.get(f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}")
+
+    transcription = await openai_client.audio.transcriptions.create(
+        model="whisper-1",
+        file=("audio.ogg", audio.content, "audio/ogg"),
+    )
+    return transcription.text
 
 
 async def send_message(chat_id: int, text: str, parse_mode: str = "Markdown"):
@@ -41,8 +61,20 @@ async def webhook(request: Request):
     chat_id = message.get("chat", {}).get("id")
     user_id = str(message.get("from", {}).get("id", chat_id))
     text = message.get("text", "")
+    voice = message.get("voice") or message.get("audio")
 
     if not chat_id:
+        return {"ok": True}
+
+    if not text and voice:
+        try:
+            text = await transcribe_voice(voice["file_id"])
+        except Exception as e:
+            print(f"Error transcribiendo audio: {e}")
+            await send_message(chat_id, "No pude entender el audio. Inténtalo de nuevo.", parse_mode=None)
+            return {"ok": True}
+
+    if not text:
         return {"ok": True}
 
     if text == "/start":
@@ -130,17 +162,41 @@ async def strava_webhook_verify(request: Request):
     return {"error": "Token inválido"}
 
 
+async def process_strava_activity(user_id: str, activity_id: int):
+    """Procesa una actividad de Strava en background."""
+    access_token = await refresh_token_if_needed(user_id)
+    if not access_token:
+        return
+    try:
+        activity = await get_activity_detail(activity_id, access_token)
+        activity_msg = format_activity_message(activity)
+        await send_message(int(user_id), activity_msg)
+        db = SessionLocal()
+        try:
+            coach_response = await ask_coach(db, user_id, activity_msg)
+            await send_message(int(user_id), coach_response)
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"Error procesando actividad Strava: {e}")
+
+
 @app.post("/strava/webhook")
-async def strava_webhook(request: Request):
+async def strava_webhook(request: Request, background_tasks: BackgroundTasks):
     """Recibe eventos de Strava cuando hay una actividad nueva."""
     data = await request.json()
 
     if data.get("object_type") != "activity" or data.get("aspect_type") != "create":
         return {"ok": True}
 
-    athlete_id = str(data.get("owner_id"))
     activity_id = data.get("object_id")
 
+    # Evitar procesar la misma actividad más de una vez
+    if activity_id in processed_activities:
+        return {"ok": True}
+    processed_activities.add(activity_id)
+
+    athlete_id = str(data.get("owner_id"))
     user_id = strava_user_map.get(athlete_id)
     if not user_id:
         from strava import get_user_id_by_athlete
@@ -152,30 +208,8 @@ async def strava_webhook(request: Request):
         print(f"Atleta {athlete_id} no vinculado a ningún usuario Telegram")
         return {"ok": True}
 
-    # Obtener token de acceso con refresco automático
-    access_token = await refresh_token_if_needed(user_id)
-    if not access_token:
-        return {"ok": True}
-
-    # Obtener detalles de la actividad
-    try:
-        activity = await get_activity_detail(activity_id, access_token)
-        activity_msg = format_activity_message(activity)
-
-        # Notificar al usuario
-        await send_message(int(user_id), activity_msg)
-
-        # Pasar al coach para análisis
-        db = SessionLocal()
-        try:
-            coach_response = await ask_coach(db, user_id, activity_msg)
-            await send_message(int(user_id), coach_response)
-        finally:
-            db.close()
-
-    except Exception as e:
-        print(f"Error procesando actividad Strava: {e}")
-
+    # Responder 200 inmediatamente y procesar en background
+    background_tasks.add_task(process_strava_activity, user_id, activity_id)
     return {"ok": True}
 
 
