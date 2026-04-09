@@ -24,13 +24,12 @@ def startup():
     init_db()
 
 
-async def send_message(chat_id: int, text: str):
+async def send_message(chat_id: int, text: str, parse_mode: str = "Markdown"):
+    body = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        body["parse_mode"] = parse_mode
     async with httpx.AsyncClient() as client:
-        await client.post(f"{TELEGRAM_API}/sendMessage", json={
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "Markdown"
-        })
+        await client.post(f"{TELEGRAM_API}/sendMessage", json=body)
 
 
 # ─── TELEGRAM WEBHOOK ────────────────────────────────────────────────────────
@@ -58,7 +57,7 @@ async def webhook(request: Request):
             "&response_type=code"
             "&scope=activity:read_all"
         )
-        await send_message(chat_id, f"🔗 Conecta tu Strava aquí:\n{auth_url}")
+        await send_message(chat_id, f"🔗 Conecta tu Strava aquí:\n{auth_url}", parse_mode=None)
         return {"ok": True}
 
     if text == "/stats":
