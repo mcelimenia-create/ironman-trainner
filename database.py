@@ -67,3 +67,12 @@ def get_db():
         yield db
     finally:
         db.close()
+
+class StravaToken(Base):
+    __tablename__ = "strava_tokens"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String, unique=True)
+    access_token = Column(String)
+    refresh_token = Column(String)
+    expires_at = Column(Integer)
+    athlete_id = Column(String)

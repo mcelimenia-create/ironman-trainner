@@ -24,21 +24,56 @@ TOKEN_FILE = "/tmp/strava_tokens.json"
 
 
 def save_strava_token(user_id: str, token_data: dict):
-    tokens = {}
-    if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE) as f:
-            tokens = json.load(f)
-    tokens[user_id] = token_data
-    with open(TOKEN_FILE, "w") as f:
-        json.dump(tokens, f)
+    db = SessionLocal()
+    try:
+        from database import StravaToken
+        athlete_id = str(token_data.get("athlete", {}).get("id", ""))
+        record = db.query(StravaToken).filter(StravaToken.user_id == user_id).first()
+        if record:
+            record.access_token = token_data["access_token"]
+            record.refresh_token = token_data["refresh_token"]
+            record.expires_at = token_data["expires_at"]
+            if athlete_id:
+                record.athlete_id = athlete_id
+        else:
+            record = StravaToken(
+                user_id=user_id,
+                access_token=token_data["access_token"],
+                refresh_token=token_data["refresh_token"],
+                expires_at=token_data["expires_at"],
+                athlete_id=athlete_id
+            )
+            db.add(record)
+        db.commit()
+    finally:
+        db.close()
 
 
 def get_strava_token(user_id: str) -> dict:
-    if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE) as f:
-            tokens = json.load(f)
-        return tokens.get(user_id)
-    return None
+    db = SessionLocal()
+    try:
+        from database import StravaToken
+        record = db.query(StravaToken).filter(StravaToken.user_id == user_id).first()
+        if record:
+            return {
+                "access_token": record.access_token,
+                "refresh_token": record.refresh_token,
+                "expires_at": record.expires_at,
+                "athlete": {"id": record.athlete_id}
+            }
+        return None
+    finally:
+        db.close()
+
+
+def get_user_id_by_athlete(athlete_id: str) -> str:
+    db = SessionLocal()
+    try:
+        from database import StravaToken
+        record = db.query(StravaToken).filter(StravaToken.athlete_id == athlete_id).first()
+        return record.user_id if record else None
+    finally:
+        db.close()
 
 
 async def refresh_token_if_needed(user_id: str) -> str:

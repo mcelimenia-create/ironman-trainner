@@ -142,19 +142,12 @@ async def strava_webhook(request: Request):
     athlete_id = str(data.get("owner_id"))
     activity_id = data.get("object_id")
 
-    # Buscar el user_id de Telegram asociado
     user_id = strava_user_map.get(athlete_id)
     if not user_id:
-        # Intentar cargar desde tokens guardados
-        import json, os
-        if os.path.exists("/tmp/strava_tokens.json"):
-            with open("/tmp/strava_tokens.json") as f:
-                tokens = json.load(f)
-            for uid, token_data in tokens.items():
-                if str(token_data.get("athlete", {}).get("id")) == athlete_id:
-                    user_id = uid
-                    strava_user_map[athlete_id] = uid
-                    break
+        from strava import get_user_id_by_athlete
+        user_id = get_user_id_by_athlete(athlete_id)
+        if user_id:
+            strava_user_map[athlete_id] = user_id
 
     if not user_id:
         print(f"Atleta {athlete_id} no vinculado a ningún usuario Telegram")
