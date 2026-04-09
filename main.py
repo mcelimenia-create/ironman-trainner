@@ -50,16 +50,16 @@ async def webhook(request: Request):
         await send_message(chat_id, "💪 *¡Hola, campeón!* Soy tu entrenador Ironman. Cuéntame cómo va el entrenamiento.")
         return {"ok": True}
 
-   if text == "/strava":
-    auth_url = (
-        "https://www.strava.com/oauth/authorize"
-        f"?client_id={STRAVA_CLIENT_ID}"
-        f"&redirect_uri={BASE_URL}/strava/callback/{user_id}"
-        "&response_type=code"
-        "&scope=activity:read_all"
-    )
-    await send_message(chat_id, f"🔗 Conecta tu Strava aquí:\n{auth_url}")
-    return {"ok": True}
+    if text == "/strava":
+        auth_url = (
+            "https://www.strava.com/oauth/authorize"
+            f"?client_id={STRAVA_CLIENT_ID}"
+            f"&redirect_uri={BASE_URL}/strava/callback/{user_id}"
+            "&response_type=code"
+            "&scope=activity:read_all"
+        )
+        await send_message(chat_id, f"🔗 Conecta tu Strava aquí:\n{auth_url}")
+        return {"ok": True}
 
     if text == "/stats":
         db = SessionLocal()
@@ -153,7 +153,7 @@ async def strava_webhook(request: Request):
         print(f"Atleta {athlete_id} no vinculado a ningún usuario Telegram")
         return {"ok": True}
 
-   # Obtener token de acceso con refresco automático
+    # Obtener token de acceso con refresco automático
     access_token = await refresh_token_if_needed(user_id)
     if not access_token:
         return {"ok": True}
