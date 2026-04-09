@@ -50,16 +50,16 @@ async def webhook(request: Request):
         await send_message(chat_id, "💪 *¡Hola, campeón!* Soy tu entrenador Ironman. Cuéntame cómo va el entrenamiento.")
         return {"ok": True}
 
-    if text == "/strava":
-        auth_url = (
-            f"https://www.strava.com/oauth/authorize"
-            f"?client_id={STRAVA_CLIENT_ID}"
-            f"&redirect_uri={BASE_URL}/strava/callback/{user_id}"
-            f"&response_type=code"
-            f"&scope=activity:read_all"
-        )
-        await send_message(chat_id, f"🔗 Conecta tu Strava aquí:\n{auth_url}")
-        return {"ok": True}
+   if text == "/strava":
+    auth_url = (
+        "https://www.strava.com/oauth/authorize"
+        f"?client_id={STRAVA_CLIENT_ID}"
+        f"&redirect_uri={BASE_URL}/strava/callback/{user_id}"
+        "&response_type=code"
+        "&scope=activity:read_all"
+    )
+    await send_message(chat_id, f"🔗 Conecta tu Strava aquí:\n{auth_url}")
+    return {"ok": True}
 
     if text == "/stats":
         db = SessionLocal()
