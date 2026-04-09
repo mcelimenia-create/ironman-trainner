@@ -57,6 +57,14 @@ class Conversation(Base):
     timestamp = Column(DateTime, default=datetime.utcnow)
 
 
+class AthleteProfile(Base):
+    __tablename__ = "athlete_profile"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String, unique=True)
+    race_date = Column(DateTime, nullable=True)
+    race_name = Column(String, nullable=True)
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
 

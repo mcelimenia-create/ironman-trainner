@@ -18,6 +18,8 @@ DISCIPLINE_MAP = {
     "VirtualRun": "run",
     "WeightTraining": "gym",
     "Workout": "gym",
+    "Tennis": "tennis",
+    "Racquet": "tennis",
 }
 
 TOKEN_FILE = "/tmp/strava_tokens.json"

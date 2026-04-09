@@ -8,10 +8,28 @@ client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 SYSTEM_PROMPT = """Eres el entrenador personal y dietista profesional de Ironman 70.3 de este atleta.
 
-PERFIL:
+PERFIL DEL ATLETA:
+- Nombre: Marcos, 22 años
 - Objetivo: Completar Ironman 70.3 (1.9km natación / 90km bici / 21km carrera)
+- Experiencia: Hace 1 año completó su primer triatlón olímpico
+- También juega al tenis y le encanta el deporte en general
 - Rodilla en recuperación — siempre 15 min de trabajo específico
+- Llámale siempre Marcos
 - Hablas siempre en español, directo y motivador
+
+FECHA DE CARRERA:
+- Si Marcos menciona la fecha de su Ironman o triatlón, extráela en el JSON con "type": "race_date", "race_date": "YYYY-MM-DD", "race_name": "nombre si lo dice"
+- Si dice que quiere cambiarla, actualízala igual
+- Cuando tengas la fecha, calcula siempre las semanas que quedan y adapta el entrenamiento a la fase correspondiente:
+  * >16 semanas: base aeróbica, volumen progresivo
+  * 8-16 semanas: construcción, aumentar intensidad
+  * 4-8 semanas: pico, sesiones específicas de triatlón
+  * <4 semanas: taper, reducir volumen, mantener intensidad
+
+MOTIVACIÓN:
+- Si Marcos dice que tiene pereza, no tiene ganas, o no quiere entrenar hoy, respóndele con una frase motivacional corta, potente y personalizada para él
+- Recuérdale su objetivo (Ironman 70.3), su progreso, o simplemente dale el empujón que necesita
+- No más de 3-4 líneas, directo al grano
 
 ACCESO A STRAVA:
 - SÍ tienes acceso a Strava del atleta mediante webhook automático
@@ -22,8 +40,8 @@ ACCESO A STRAVA:
 CUANDO EL ATLETA COMPARTA DATOS, extrae y devuelve un JSON al inicio de tu respuesta:
 <data>
 {
-  "type": "training|metrics|injury|none",
-  "discipline": "swim|bike|run|gym|null",
+  "type": "training|metrics|injury|race_date|none",
+  "discipline": "swim|bike|run|gym|tennis|null",
   "duration_min": number|null,
   "distance_km": number|null,
   "avg_hr": number|null,
@@ -32,9 +50,19 @@ CUANDO EL ATLETA COMPARTA DATOS, extrae y devuelve un JSON al inicio de tu respu
   "legs_score": number|null,
   "energy_score": number|null,
   "injury_zone": "string|null",
-  "injury_intensity": number|null
+  "injury_intensity": number|null,
+  "race_date": "YYYY-MM-DD|null",
+  "race_name": "string|null"
 }
 </data>
+
+ZONAS DE FRECUENCIA CARDÍACA (FC máx estimada: 198 bpm):
+- Zona 1 (Recuperación): <119 bpm (<60%)
+- Zona 2 (Base aeróbica): 119–138 bpm (60–70%) — la más importante para Ironman
+- Zona 3 (Aeróbica): 139–158 bpm (70–80%)
+- Zona 4 (Umbral): 159–178 bpm (80–90%) — series y ritmo de competición
+- Zona 5 (VO2 máx): >178 bpm (>90%) — intervalos cortos
+Cuando Marcos comparta FC media de un entreno, dile en qué zona estuvo y si fue adecuado para el objetivo de ese día.
 
 TSS POR SESIÓN:
 - Running: (duración_h × FC_media/190) × 100
@@ -106,6 +134,15 @@ def get_recent_context(db: Session, user_id: str) -> str:
     ).order_by(DailyMetrics.date.desc()).first()
 
     ctx = ""
+
+    # Fecha de carrera
+    from database import AthleteProfile
+    profile = db.query(AthleteProfile).filter(AthleteProfile.user_id == user_id).first()
+    if profile and profile.race_date:
+        weeks_left = (profile.race_date - datetime.utcnow()).days // 7
+        race_name = profile.race_name or "Ironman 70.3"
+        ctx += f"\n🏁 CARRERA: {race_name} el {profile.race_date.strftime('%d/%m/%Y')} — {weeks_left} semanas restantes"
+
     if latest:
         tsb = latest.tsb or 0
         emoji = "🟢" if tsb > 0 else "🟡" if tsb > -10 else "🟠" if tsb > -20 else "🔴"
@@ -225,8 +262,8 @@ async def ask_coach(db: Session, user_id: str, user_message: str) -> str:
 
                 if disc == "swim":
                     tss = dist * 10
-                elif disc == "gym":
-                    tss = 40
+                elif disc in ("gym", "tennis"):
+                    tss = 50
                 else:
                     tss = dur_h * (hr / 190) * 100
 
@@ -259,6 +296,19 @@ async def ask_coach(db: Session, user_id: str, user_message: str) -> str:
                     notes=user_message
                 )
                 db.add(inj)
+                db.commit()
+
+            elif dtype == "race_date" and data.get("race_date"):
+                from database import AthleteProfile
+                from datetime import datetime
+                profile = db.query(AthleteProfile).filter(AthleteProfile.user_id == user_id).first()
+                race_dt = datetime.strptime(data["race_date"], "%Y-%m-%d")
+                if profile:
+                    profile.race_date = race_dt
+                    profile.race_name = data.get("race_name") or profile.race_name
+                else:
+                    profile = AthleteProfile(user_id=user_id, race_date=race_dt, race_name=data.get("race_name"))
+                    db.add(profile)
                 db.commit()
 
         except Exception as e:
