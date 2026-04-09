@@ -7,7 +7,7 @@ from coach import ask_coach
 from strava import (
     STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, STRAVA_VERIFY_TOKEN,
     exchange_code, get_activity_detail, save_strava_token,
-    get_strava_token, format_activity_message
+    get_strava_token, refresh_token_if_needed, format_activity_message
 )
 
 app = FastAPI()
