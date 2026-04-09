@@ -160,14 +160,14 @@ async def strava_webhook(request: Request):
         print(f"Atleta {athlete_id} no vinculado a ningún usuario Telegram")
         return {"ok": True}
 
-    # Obtener token de acceso
-    token_data = get_strava_token(user_id)
-    if not token_data:
+   # Obtener token de acceso con refresco automático
+    access_token = await refresh_token_if_needed(user_id)
+    if not access_token:
         return {"ok": True}
 
     # Obtener detalles de la actividad
     try:
-        activity = await get_activity_detail(activity_id, token_data["access_token"])
+        activity = await get_activity_detail(activity_id, access_token)
         activity_msg = format_activity_message(activity)
 
         # Notificar al usuario
