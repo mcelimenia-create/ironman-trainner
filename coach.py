@@ -121,6 +121,14 @@ SEÑALES DE ALERTA:
 
 def get_recent_context(db: Session, user_id: str) -> str:
     """Obtiene estadísticas recientes para añadir al contexto."""
+    from zoneinfo import ZoneInfo
+    DIAS = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+    MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio",
+             "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+    now = datetime.now(tz=ZoneInfo("Europe/Madrid"))
+    ctx = (f"\n⏰ FECHA Y HORA ACTUAL: {DIAS[now.weekday()]} {now.day} de "
+           f"{MESES[now.month - 1]} de {now.year}, {now.strftime('%H:%M')} (hora Madrid)")
+
     # Últimos 30 días de entrenamientos
     since = datetime.utcnow() - timedelta(days=30)
     trainings = db.query(Training).filter(
@@ -132,8 +140,6 @@ def get_recent_context(db: Session, user_id: str) -> str:
     latest = db.query(DailyMetrics).filter(
         DailyMetrics.user_id == user_id
     ).order_by(DailyMetrics.date.desc()).first()
-
-    ctx = ""
 
     # Fecha de carrera
     from database import AthleteProfile
