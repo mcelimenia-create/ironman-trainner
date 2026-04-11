@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime, Text
+from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime, Text, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
@@ -63,6 +63,30 @@ class AthleteProfile(Base):
     user_id = Column(String, unique=True)
     race_date = Column(DateTime, nullable=True)
     race_name = Column(String, nullable=True)
+
+
+class RaceResult(Base):
+    """Historial de carreras completadas."""
+    __tablename__ = "race_results"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String)
+    date = Column(DateTime)
+    race_name = Column(String)
+    race_type = Column(String)          # ironman / olimpico / maraton / etc.
+    finish_time = Column(String, nullable=True)   # "HH:MM:SS"
+    position = Column(String, nullable=True)
+    notes = Column(Text, nullable=True)
+
+
+class MemoryNote(Base):
+    """Notas permanentes que el bot debe recordar siempre."""
+    __tablename__ = "memory_notes"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String)
+    key = Column(String)                # identificador único, p.ej. "peso_objetivo"
+    value = Column(Text)                # contenido de la nota
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("user_id", "key"),)
 
 
 def init_db():

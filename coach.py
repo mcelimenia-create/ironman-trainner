@@ -1,8 +1,11 @@
 import anthropic
 import os
 from sqlalchemy.orm import Session
-from database import Training, DailyMetrics, Injury, Conversation
+from database import Training, DailyMetrics, Injury, Conversation, RaceResult, MemoryNote
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+TZ_MADRID = ZoneInfo("Europe/Madrid")
 
 client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
@@ -40,7 +43,7 @@ ACCESO A STRAVA:
 CUANDO EL ATLETA COMPARTA DATOS, extrae y devuelve un JSON al inicio de tu respuesta:
 <data>
 {
-  "type": "training|metrics|injury|race_date|none",
+  "type": "training|metrics|injury|race_date|race_result|memory|none",
   "discipline": "swim|bike|run|gym|tennis|null",
   "duration_min": number|null,
   "distance_km": number|null,
@@ -52,9 +55,24 @@ CUANDO EL ATLETA COMPARTA DATOS, extrae y devuelve un JSON al inicio de tu respu
   "injury_zone": "string|null",
   "injury_intensity": number|null,
   "race_date": "YYYY-MM-DD|null",
-  "race_name": "string|null"
+  "race_name": "string|null",
+  "race_result_date": "YYYY-MM-DD|null",
+  "race_result_name": "string|null",
+  "race_result_type": "ironman|olimpico|sprint|maraton|media_maraton|10k|otro|null",
+  "race_result_time": "HH:MM:SS|null",
+  "race_result_position": "string|null",
+  "race_result_notes": "string|null",
+  "memory_key": "string|null",
+  "memory_value": "string|null"
 }
 </data>
+
+CUÁNDO USAR CADA TIPO:
+- "race_result": cuando Marcos cuenta que completó/participó en una carrera o evento pasado (distinto de la próxima carrera)
+- "memory": para guardar hechos importantes que debes recordar siempre (metas personales, PRs, datos relevantes del atleta). Usa una key descriptiva única, p.ej. "pr_10k", "peso_objetivo", "primer_triatlon"
+- "race_date": solo para la PRÓXIMA carrera objetivo
+
+SIEMPRE guarda como "memory" cualquier dato relevante que Marcos mencione y que no sea un entreno ni una métrica: su mejor marca, una carrera completada, su meta de peso, un hito importante.
 
 ZONAS DE FRECUENCIA CARDÍACA (FC máx estimada: 198 bpm):
 - Zona 1 (Recuperación): <119 bpm (<60%)
@@ -121,20 +139,19 @@ SEÑALES DE ALERTA:
 
 def get_recent_context(db: Session, user_id: str) -> str:
     """Obtiene estadísticas recientes para añadir al contexto."""
-    from zoneinfo import ZoneInfo
-    DIAS = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
-    MESES = ["enero", "febrero", "marzo", "abril", "mayo", "junio",
-             "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
-    now = datetime.now(tz=ZoneInfo("Europe/Madrid"))
-    ctx = (f"\n⏰ FECHA Y HORA ACTUAL: {DIAS[now.weekday()]} {now.day} de "
-           f"{MESES[now.month - 1]} de {now.year}, {now.strftime('%H:%M')} (hora Madrid)")
+    now_madrid = datetime.now(TZ_MADRID)
+    now_utc = datetime.utcnow()
 
-    # Últimos 30 días de entrenamientos
-    since = datetime.utcnow() - timedelta(days=30)
+    # Fecha y hora actual (siempre presente)
+    dia_semana = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"][now_madrid.weekday()]
+    ctx = f"\n🕐 FECHA Y HORA ACTUAL: {dia_semana} {now_madrid.strftime('%d/%m/%Y a las %H:%M')} (Madrid)"
+
+    # Últimos 60 días de entrenamientos (todos, sin límite reducido)
+    since = now_utc - timedelta(days=60)
     trainings = db.query(Training).filter(
         Training.user_id == user_id,
         Training.date >= since
-    ).order_by(Training.date.desc()).limit(10).all()
+    ).order_by(Training.date.desc()).all()
 
     # CTL/ATL/TSB actual
     latest = db.query(DailyMetrics).filter(
@@ -145,9 +162,10 @@ def get_recent_context(db: Session, user_id: str) -> str:
     from database import AthleteProfile
     profile = db.query(AthleteProfile).filter(AthleteProfile.user_id == user_id).first()
     if profile and profile.race_date:
-        weeks_left = (profile.race_date - datetime.utcnow()).days // 7
+        weeks_left = (profile.race_date - now_utc).days // 7
+        days_left = (profile.race_date - now_utc).days
         race_name = profile.race_name or "Ironman 70.3"
-        ctx += f"\n🏁 CARRERA: {race_name} el {profile.race_date.strftime('%d/%m/%Y')} — {weeks_left} semanas restantes"
+        ctx += f"\n🏁 CARRERA: {race_name} el {profile.race_date.strftime('%d/%m/%Y')} — {weeks_left} semanas y {days_left % 7} días restantes"
 
     if latest:
         tsb = latest.tsb or 0
@@ -157,22 +175,57 @@ def get_recent_context(db: Session, user_id: str) -> str:
             ctx += f" | Peso: {latest.weight_kg}kg"
 
     if trainings:
-        ctx += f"\n📅 Últimos entrenamientos ({len(trainings)}):"
-        for t in trainings[:5]:
-            ctx += f"\n  - {t.date.strftime('%d/%m')} {t.discipline}: {t.duration_min}min"
+        ctx += f"\n📅 Entrenamientos últimos 60 días ({len(trainings)} sesiones):"
+        for t in trainings[:20]:
+            dist = f" {t.distance_km:.1f}km" if t.distance_km else ""
+            hr = f" FC:{t.avg_hr}bpm" if t.avg_hr else ""
+            ctx += f"\n  - {t.date.strftime('%d/%m/%Y')} {t.discipline}: {t.duration_min}min{dist}{hr}"
 
-    # Lesiones activas
+    # Historial completo de pesos (todos los registros)
+    all_weights = db.query(DailyMetrics).filter(
+        DailyMetrics.user_id == user_id,
+        DailyMetrics.weight_kg.isnot(None)
+    ).order_by(DailyMetrics.date.asc()).all()
+    if all_weights:
+        ctx += f"\n⚖️ Historial de peso completo ({len(all_weights)} registros):"
+        for w in all_weights:
+            ctx += f"\n  - {w.date.strftime('%d/%m/%Y')}: {w.weight_kg}kg"
+
+    # Historial de carreras completadas
+    race_results = db.query(RaceResult).filter(
+        RaceResult.user_id == user_id
+    ).order_by(RaceResult.date.asc()).all()
+    if race_results:
+        ctx += f"\n🏅 Carreras completadas:"
+        for r in race_results:
+            time_str = f" — {r.finish_time}" if r.finish_time else ""
+            pos_str = f" (pos. {r.position})" if r.position else ""
+            notes_str = f" — {r.notes}" if r.notes else ""
+            ctx += f"\n  - {r.date.strftime('%d/%m/%Y')} {r.race_name} ({r.race_type}){time_str}{pos_str}{notes_str}"
+
+    # Notas de memoria permanentes
+    memory_notes = db.query(MemoryNote).filter(
+        MemoryNote.user_id == user_id
+    ).order_by(MemoryNote.updated_at.asc()).all()
+    if memory_notes:
+        ctx += f"\n🧠 Memoria permanente:"
+        for n in memory_notes:
+            ctx += f"\n  - [{n.key}] {n.value}"
+
+    # Lesiones (historial completo)
     injuries = db.query(Injury).filter(
         Injury.user_id == user_id,
-        Injury.date >= datetime.utcnow() - timedelta(days=14)
-    ).all()
+        Injury.date >= now_utc - timedelta(days=180)
+    ).order_by(Injury.date.desc()).all()
     if injuries:
-        ctx += f"\n⚠️ Lesiones recientes: {', '.join(i.zone for i in injuries)}"
+        ctx += f"\n⚠️ Lesiones/molestias registradas:"
+        for inj in injuries:
+            ctx += f"\n  - {inj.date.strftime('%d/%m/%Y')} {inj.zone} (intensidad {inj.intensity}/10)"
 
     return ctx
 
 
-def get_conversation_history(db: Session, user_id: str, limit: int = 10):
+def get_conversation_history(db: Session, user_id: str, limit: int = 50):
     """Recupera historial de conversación."""
     msgs = db.query(Conversation).filter(
         Conversation.user_id == user_id
@@ -229,14 +282,12 @@ def save_training_data(db: Session, user_id: str, data: dict, tss: float):
 async def ask_coach(db: Session, user_id: str, user_message: str) -> str:
     import json, re
 
-    # Contexto con datos recientes
+    # Contexto con datos recientes del atleta
     context = get_recent_context(db, user_id)
+    # Solo cargamos historial de mensajes con datos personales (no Q&A genérico)
     history = get_conversation_history(db, user_id)
 
-    # Guardar mensaje del usuario
-    save_message(db, user_id, "user", user_message)
-
-    # Construir mensajes
+    # Construir mensajes (el mensaje actual se incluye pero aún no se guarda)
     messages = history + [{"role": "user", "content": user_message}]
 
     system = SYSTEM_PROMPT
@@ -254,10 +305,13 @@ async def ask_coach(db: Session, user_id: str, user_message: str) -> str:
 
     # Extraer y guardar datos estructurados
     data_match = re.search(r"<data>(.*?)</data>", full_response, re.DOTALL)
+    has_personal_data = False
+
     if data_match:
         try:
             data = json.loads(data_match.group(1).strip())
             dtype = data.get("type")
+            has_personal_data = dtype != "none"
 
             if dtype == "training":
                 # Calcular TSS
@@ -317,13 +371,47 @@ async def ask_coach(db: Session, user_id: str, user_message: str) -> str:
                     db.add(profile)
                 db.commit()
 
+            elif dtype == "race_result" and data.get("race_result_date"):
+                result = RaceResult(
+                    user_id=user_id,
+                    date=datetime.strptime(data["race_result_date"], "%Y-%m-%d"),
+                    race_name=data.get("race_result_name", ""),
+                    race_type=data.get("race_result_type", "otro"),
+                    finish_time=data.get("race_result_time"),
+                    position=data.get("race_result_position"),
+                    notes=data.get("race_result_notes"),
+                )
+                db.add(result)
+                db.commit()
+
+            elif dtype == "memory" and data.get("memory_key") and data.get("memory_value"):
+                existing = db.query(MemoryNote).filter(
+                    MemoryNote.user_id == user_id,
+                    MemoryNote.key == data["memory_key"]
+                ).first()
+                if existing:
+                    existing.value = data["memory_value"]
+                    existing.updated_at = datetime.utcnow()
+                else:
+                    note = MemoryNote(
+                        user_id=user_id,
+                        key=data["memory_key"],
+                        value=data["memory_value"],
+                    )
+                    db.add(note)
+                db.commit()
+
         except Exception as e:
             print(f"Error parsing data: {e}")
 
     # Limpiar el JSON de la respuesta que ve el usuario
     clean_response = re.sub(r"<data>.*?</data>", "", full_response, flags=re.DOTALL).strip()
 
-    # Guardar respuesta del asistente
-    save_message(db, user_id, "assistant", clean_response)
+    # Solo guardar en historial si el mensaje contenía datos personales reales.
+    # Las preguntas genéricas (dieta, técnica, motivación...) no se persisten:
+    # el bot las responde bien con el system prompt sin necesidad de recordarlas.
+    if has_personal_data:
+        save_message(db, user_id, "user", user_message)
+        save_message(db, user_id, "assistant", clean_response)
 
     return clean_response
