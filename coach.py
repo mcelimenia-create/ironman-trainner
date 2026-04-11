@@ -369,6 +369,15 @@ def save_training_data(db: Session, user_id: str, data: dict, tss: float):
 async def ask_coach(db: Session, user_id: str, user_message: str) -> str:
     import json, re
 
+    # Fecha y hora actual — se inyecta SIEMPRE, independientemente de la BD
+    now_madrid = datetime.now(TZ_MADRID)
+    DIAS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+    datetime_line = (
+        f"AHORA MISMO son las {now_madrid.strftime('%H:%M')} del "
+        f"{DIAS_ES[now_madrid.weekday()]} {now_madrid.day} de "
+        f"{now_madrid.strftime('%B')} de {now_madrid.year} (hora de Zaragoza/Madrid)."
+    )
+
     # Contexto con datos recientes del atleta
     context = get_recent_context(db, user_id)
     # Solo cargamos historial de mensajes con datos personales (no Q&A genérico)
@@ -377,7 +386,8 @@ async def ask_coach(db: Session, user_id: str, user_message: str) -> str:
     # Construir mensajes (el mensaje actual se incluye pero aún no se guarda)
     messages = history + [{"role": "user", "content": user_message}]
 
-    system = SYSTEM_PROMPT
+    # La fecha/hora va AL PRINCIPIO del system prompt, antes de todo
+    system = f"{datetime_line}\n\n{SYSTEM_PROMPT}"
     if context:
         system += f"\n\nCONTEXTO ACTUAL DEL ATLETA:{context}"
 
