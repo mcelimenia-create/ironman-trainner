@@ -1,7 +1,7 @@
 import anthropic
 import os
 from sqlalchemy.orm import Session
-from database import Training, DailyMetrics, Injury, Conversation, RaceResult, MemoryNote
+from database import Training, DailyMetrics, Injury, Conversation, RaceResult, MemoryNote, PlannedSession
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -10,6 +10,11 @@ TZ_MADRID = ZoneInfo("Europe/Madrid")
 client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 SYSTEM_PROMPT = """Eres el entrenador personal y dietista profesional de Ironman 70.3 de este atleta.
+
+FECHA Y HORA:
+- En el contexto siempre recibirás la fecha y hora exacta actual (Madrid).
+- SIEMPRE úsala. Cuando Marcos pregunte qué toca hoy, qué hacer, o algo relacionado con el momento actual, menciona explícitamente el día y la hora ("Son las 14:32 del viernes...").
+- Nunca uses fechas ni horas inventadas. Si no ves la fecha en el contexto, di que no tienes ese dato.
 
 PERFIL DEL ATLETA:
 - Nombre: Marcos, 22 años
@@ -40,10 +45,17 @@ ACCESO A STRAVA:
 - NO necesitas que el atleta te pase los datos manualmente si usa Strava
 - Cuando recibes datos con el prefijo "📡 Actividad de Strava registrada automáticamente", son datos reales de Strava
 
+PLAN SEMANAL:
+- Cuando generes un plan semanal (ya sea por /plan o cuando Marcos te lo pida), incluye SIEMPRE el bloque <data> con "type": "weekly_plan" Y las sesiones estructuradas.
+- El plan debe cubrir exactamente los 7 días a partir del próximo lunes (o hoy si es lunes).
+- Cada sesión debe tener fecha exacta en formato YYYY-MM-DD.
+- Los días de descanso también se incluyen con discipline "rest".
+- Tras guardar el plan puedes mostrarlo de forma legible al atleta.
+
 CUANDO EL ATLETA COMPARTA DATOS, extrae y devuelve un JSON al inicio de tu respuesta:
 <data>
 {
-  "type": "training|metrics|injury|race_date|race_result|memory|none",
+  "type": "training|metrics|injury|race_date|race_result|memory|weekly_plan|none",
   "discipline": "swim|bike|run|gym|tennis|null",
   "duration_min": number|null,
   "distance_km": number|null,
@@ -63,7 +75,16 @@ CUANDO EL ATLETA COMPARTA DATOS, extrae y devuelve un JSON al inicio de tu respu
   "race_result_position": "string|null",
   "race_result_notes": "string|null",
   "memory_key": "string|null",
-  "memory_value": "string|null"
+  "memory_value": "string|null",
+  "sessions": [
+    {
+      "date": "YYYY-MM-DD",
+      "discipline": "swim|bike|run|gym|rest",
+      "duration_min": number|null,
+      "intensity": "Z1|Z2|Z3|Z4|series|fuerza|recuperación|null",
+      "description": "descripción breve de la sesión"
+    }
+  ]
 }
 </data>
 
@@ -222,6 +243,30 @@ def get_recent_context(db: Session, user_id: str) -> str:
         for inj in injuries:
             ctx += f"\n  - {inj.date.strftime('%d/%m/%Y')} {inj.zone} (intensidad {inj.intensity}/10)"
 
+    # Plan semanal activo (semana actual y siguiente si existe)
+    week_start = (now_utc - timedelta(days=now_utc.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    plan_sessions = db.query(PlannedSession).filter(
+        PlannedSession.user_id == user_id,
+        PlannedSession.week_start >= week_start,
+        PlannedSession.week_start < week_start + timedelta(days=14)
+    ).order_by(PlannedSession.date.asc()).all()
+    if plan_sessions:
+        DIAS_ES = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+        ctx += f"\n📋 Plan semanal activo:"
+        for s in plan_sessions:
+            check = "✅" if s.completed else "⬜"
+            dur = f" {s.duration_min}min" if s.duration_min else ""
+            intens = f" [{s.intensity}]" if s.intensity else ""
+            dia = DIAS_ES[s.date.weekday()]
+            ctx += f"\n  {check} {dia} {s.date.strftime('%d/%m')} — {s.discipline}{dur}{intens}: {s.description or ''}"
+        # Cumplimiento de la semana actual
+        semana_actual = [s for s in plan_sessions if s.week_start.date() == week_start.date()]
+        no_rest = [s for s in semana_actual if s.discipline != "rest"]
+        completadas = [s for s in no_rest if s.completed]
+        if no_rest:
+            pct = int(len(completadas) / len(no_rest) * 100)
+            ctx += f"\n  → Cumplimiento semana: {len(completadas)}/{len(no_rest)} sesiones ({pct}%)"
+
     return ctx
 
 
@@ -263,6 +308,48 @@ def update_ctl_atl(db: Session, user_id: str, tss: float):
         db.add(record)
     db.commit()
     return ctl, atl, tsb
+
+
+def save_weekly_plan(db: Session, user_id: str, sessions: list):
+    """Guarda el plan semanal, borrando el anterior de esa semana."""
+    if not sessions:
+        return
+    dates = [datetime.strptime(s["date"], "%Y-%m-%d") for s in sessions]
+    week_start = min(dates) - timedelta(days=min(dates).weekday())
+    week_start = week_start.replace(hour=0, minute=0, second=0, microsecond=0)
+    # Borrar plan anterior de esa semana para reemplazarlo
+    db.query(PlannedSession).filter(
+        PlannedSession.user_id == user_id,
+        PlannedSession.week_start == week_start
+    ).delete()
+    for s in sessions:
+        session_date = datetime.strptime(s["date"], "%Y-%m-%d")
+        db.add(PlannedSession(
+            user_id=user_id,
+            date=session_date,
+            week_start=week_start,
+            discipline=s.get("discipline", "rest"),
+            duration_min=s.get("duration_min"),
+            intensity=s.get("intensity"),
+            description=s.get("description"),
+        ))
+    db.commit()
+
+
+def mark_sessions_completed(db: Session, user_id: str, discipline: str, training_date: datetime):
+    """Marca como completada la sesión planificada que coincida con disciplina y fecha."""
+    day_start = training_date.replace(hour=0, minute=0, second=0, microsecond=0)
+    day_end = day_start + timedelta(days=1)
+    session = db.query(PlannedSession).filter(
+        PlannedSession.user_id == user_id,
+        PlannedSession.date >= day_start,
+        PlannedSession.date < day_end,
+        PlannedSession.discipline == discipline,
+        PlannedSession.completed == False
+    ).first()
+    if session:
+        session.completed = True
+        db.commit()
 
 
 def save_training_data(db: Session, user_id: str, data: dict, tss: float):
@@ -329,6 +416,12 @@ async def ask_coach(db: Session, user_id: str, user_message: str) -> str:
 
                 save_training_data(db, user_id, data, tss)
                 update_ctl_atl(db, user_id, tss)
+                # Marcar la sesión planificada como completada automáticamente
+                if disc:
+                    mark_sessions_completed(db, user_id, disc, datetime.utcnow())
+
+            elif dtype == "weekly_plan" and data.get("sessions"):
+                save_weekly_plan(db, user_id, data["sessions"])
 
             elif dtype == "metrics":
                 today = db.query(DailyMetrics).filter(

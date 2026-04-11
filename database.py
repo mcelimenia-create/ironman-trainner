@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime, Text, UniqueConstraint
+from sqlalchemy import create_engine, Column, Integer, Float, String, DateTime, Text, UniqueConstraint, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
@@ -87,6 +87,20 @@ class MemoryNote(Base):
     value = Column(Text)                # contenido de la nota
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     __table_args__ = (UniqueConstraint("user_id", "key"),)
+
+
+class PlannedSession(Base):
+    """Sesiones del plan semanal generado por el coach."""
+    __tablename__ = "planned_sessions"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String)
+    date = Column(DateTime)             # fecha exacta de la sesión
+    week_start = Column(DateTime)       # lunes de esa semana (para agrupar)
+    discipline = Column(String)         # swim / bike / run / gym / rest
+    duration_min = Column(Integer, nullable=True)
+    intensity = Column(String, nullable=True)   # Z1 / Z2 / Z3 / series / etc.
+    description = Column(Text, nullable=True)
+    completed = Column(Boolean, default=False)
 
 
 def init_db():

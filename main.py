@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import RedirectResponse
 from database import init_db, SessionLocal
 from coach import ask_coach
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -318,10 +318,43 @@ async def webhook(request: Request):
         await send_message(chat_id, "Analizando tu estado y preparando el plan... ⏳", parse_mode=None)
         db = SessionLocal()
         try:
-            response = await ask_coach(db, user_id, "Dame el plan de entrenamientos para esta semana basándote en mi forma actual, las semanas que quedan para mi carrera y mi estado de fatiga. Sé específico con días, disciplinas, duraciones e intensidades.")
+            response = await ask_coach(db, user_id, "Dame el plan de entrenamientos para esta semana basándote en mi forma actual, las semanas que quedan para mi carrera y mi estado de fatiga. Sé específico con días, disciplinas, duraciones e intensidades. Incluye el bloque <data> con weekly_plan y todas las sesiones estructuradas.")
             await send_message(chat_id, response)
         except Exception as e:
             print(f"Error generando plan: {e}")
+        finally:
+            db.close()
+        return {"ok": True}
+
+    if text == "/semana":
+        from database import PlannedSession
+        db = SessionLocal()
+        try:
+            now = datetime.now(tz=timezone.utc).replace(tzinfo=None)
+            week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+            sessions = db.query(PlannedSession).filter(
+                PlannedSession.user_id == user_id,
+                PlannedSession.week_start == week_start
+            ).order_by(PlannedSession.date.asc()).all()
+            if not sessions:
+                await send_message(chat_id, "No tienes plan para esta semana. Usa /plan para generar uno.", parse_mode=None)
+            else:
+                DIAS = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+                no_rest = [s for s in sessions if s.discipline != "rest"]
+                completadas = sum(1 for s in no_rest if s.completed)
+                pct = int(completadas / len(no_rest) * 100) if no_rest else 0
+                msg = f"📋 *Plan semana {week_start.strftime('%d/%m')}* — {completadas}/{len(no_rest)} completadas ({pct}%)\n\n"
+                for s in sessions:
+                    if s.discipline == "rest":
+                        msg += f"😴 *{DIAS[s.date.weekday()]} {s.date.strftime('%d/%m')}* — Descanso\n"
+                    else:
+                        check = "✅" if s.completed else "⬜"
+                        dur = f" {s.duration_min}min" if s.duration_min else ""
+                        intens = f" [{s.intensity}]" if s.intensity else ""
+                        msg += f"{check} *{DIAS[s.date.weekday()]} {s.date.strftime('%d/%m')}* — {s.discipline.upper()}{dur}{intens}\n"
+                        if s.description:
+                            msg += f"   _{s.description}_\n"
+                await send_message(chat_id, msg)
         finally:
             db.close()
         return {"ok": True}
