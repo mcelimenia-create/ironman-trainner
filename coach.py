@@ -463,7 +463,6 @@ async def ask_coach(db: Session, user_id: str, user_message: str) -> str:
 
             elif dtype == "race_date" and data.get("race_date"):
                 from database import AthleteProfile
-                from datetime import datetime
                 profile = db.query(AthleteProfile).filter(AthleteProfile.user_id == user_id).first()
                 race_dt = datetime.strptime(data["race_date"], "%Y-%m-%d")
                 if profile:
