@@ -10,3 +10,4 @@ httpx
 openai
 matplotlib
 apscheduler
+tzdata
