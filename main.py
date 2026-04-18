@@ -685,7 +685,12 @@ DATOS DEL ATLETA:
 - Próximas sesiones: {', '.join(next_sessions) if next_sessions else 'sin sesiones programadas'}
 
 INSTRUCCIONES:
-Responde en máximo 4 puntos concretos y accionables. Sin introducciones largas. Directo al grano. Usa emojis de forma moderada. Máximo 200 palabras."""
+- Responde en exactamente 3-4 puntos numerados (1. 2. 3. 4.)
+- Cada punto en una línea separada
+- Sin asteriscos, sin markdown, sin negritas, sin guiones
+- Sin introducción ni cierre, ve directo a los puntos
+- Usa un emoji al inicio de cada punto
+- Máximo 180 palabras en total"""
 
     try:
         import anthropic
