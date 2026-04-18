@@ -11,3 +11,4 @@ openai
 matplotlib
 apscheduler
 tzdata
+supabase==1.2.1
