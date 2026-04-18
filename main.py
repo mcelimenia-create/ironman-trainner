@@ -455,12 +455,12 @@ async def strava_webhook(request: Request, background_tasks: BackgroundTasks):
             strava_user_map[athlete_id] = user_id
 
         if not user_id:
-        app_user_id = get_supabase_user_by_athlete(athlete_id)
-        if app_user_id:
-            background_tasks.add_task(process_strava_activity_app, app_user_id, activity_id)
-        else:
-            print(f"Atleta {athlete_id} no vinculado a ningún usuario")
-        return {"ok": True}
+            app_user_id = get_supabase_user_by_athlete(athlete_id)
+            if app_user_id:
+                background_tasks.add_task(process_strava_activity_app, app_user_id, activity_id)
+            else:
+                print(f"Atleta {athlete_id} no vinculado a ningún usuario")
+            return {"ok": True}
 
     background_tasks.add_task(process_strava_activity, user_id, activity_id)
     return {"ok": True}
