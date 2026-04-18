@@ -598,3 +598,55 @@ async def app_strava_callback(user_id: str, code: str = None, error: str = None)
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/app/strava/sync/{user_id}")
+async def app_strava_sync(user_id: str):
+    if not SUPABASE_URL:
+        return {"error": "Supabase not configured"}
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=strava_access_token,strava_refresh_token,strava_token_expires_at",
+            headers=SB_HEADERS,
+        )
+        data = r.json()
+    if not data or not data[0].get("strava_access_token"):
+        return {"error": "Strava not connected"}
+
+    profile = data[0]
+    access_token = profile["strava_access_token"]
+
+    if profile.get("strava_token_expires_at") and profile["strava_token_expires_at"] < time.time():
+        async with httpx.AsyncClient() as client:
+            r = await client.post("https://www.strava.com/oauth/token", data={
+                "client_id": STRAVA_CLIENT_ID, "client_secret": STRAVA_CLIENT_SECRET,
+                "grant_type": "refresh_token", "refresh_token": profile["strava_refresh_token"],
+            })
+            new_tokens = r.json()
+        if "access_token" in new_tokens:
+            access_token = new_tokens["access_token"]
+            await update_supabase_profile(user_id, {
+                "strava_access_token": new_tokens["access_token"],
+                "strava_refresh_token": new_tokens["refresh_token"],
+                "strava_token_expires_at": new_tokens["expires_at"],
+            })
+
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            "https://www.strava.com/api/v3/athlete/activities?per_page=60&page=1",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        activities = r.json()
+
+    if not isinstance(activities, list):
+        return {"error": "Error fetching activities", "detail": activities}
+
+    synced = 0
+    for activity in activities:
+        try:
+            await upsert_supabase_activity(activity, user_id)
+            synced += 1
+        except Exception as e:
+            print(f"Error syncing activity {activity.get('id')}: {e}")
+
+    return {"synced": synced}
