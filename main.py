@@ -455,7 +455,7 @@ async def strava_webhook(request: Request, background_tasks: BackgroundTasks):
             strava_user_map[athlete_id] = user_id
 
     if not user_id:
-        app_user_id = get_supabase_user_by_athlete(athlete_id)
+        app_user_id = await get_supabase_user_by_athlete(athlete_id)
         if app_user_id:
             background_tasks.add_task(process_strava_activity_app, app_user_id, activity_id)
         else:
@@ -469,72 +469,98 @@ async def strava_webhook(request: Request, background_tasks: BackgroundTasks):
 # ─── APP STRAVA OAUTH ─────────────────────────────────────────────────────────
 
 import time
-from supabase import create_client as create_supabase_client
 from fastapi.responses import HTMLResponse
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
-sb = create_supabase_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_URL and SUPABASE_SERVICE_KEY else None
+SB_HEADERS = {
+    "apikey": SUPABASE_SERVICE_KEY,
+    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+    "Content-Type": "application/json",
+}
+
+SUCCESS_HTML = "<html><body style='background:#000;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;flex-direction:column;gap:16px;text-align:center'><div style='font-size:60px'>✅</div><h2>¡Strava conectado!</h2><p style='color:#888'>Cierra esta ventana y vuelve a la app.</p></body></html>"
+ERROR_HTML   = "<html><body style='background:#000;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;flex-direction:column;gap:16px;text-align:center'><div style='font-size:60px'>❌</div><h2>Error al conectar</h2><p style='color:#888'>Cierra esta ventana e inténtalo de nuevo.</p></body></html>"
 
 
-def get_supabase_user_by_athlete(athlete_id: str):
-    if not sb:
+async def get_supabase_user_by_athlete(athlete_id: str):
+    if not SUPABASE_URL:
         return None
-    res = sb.table("profiles").select("id").eq("strava_athlete_id", athlete_id).execute()
-    return res.data[0]["id"] if res.data else None
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/profiles?strava_athlete_id=eq.{athlete_id}&select=id",
+            headers=SB_HEADERS,
+        )
+        data = r.json()
+        return data[0]["id"] if data else None
 
 
-async def sync_activity_to_supabase(user_id: str, activity: dict):
-    if not sb:
+async def update_supabase_profile(user_id: str, data: dict):
+    if not SUPABASE_URL:
         return
-    disc_map = {
-        "Run": "run", "Ride": "bike", "VirtualRide": "bike",
-        "Swim": "swim", "WeightTraining": "gym", "Workout": "gym",
-    }
-    sb.table("activities").upsert({
-        "user_id": user_id,
-        "strava_id": str(activity["id"]),
-        "discipline": disc_map.get(activity.get("type", ""), "run"),
-        "title": activity.get("name", "Actividad"),
-        "date": activity.get("start_date_local", "")[:10],
-        "duration_min": round(activity.get("moving_time", 0) / 60),
-        "distance_km": round(activity.get("distance", 0) / 1000, 2),
-        "avg_hr": activity.get("average_heartrate"),
-        "max_hr": activity.get("max_heartrate"),
-        "avg_speed": round(activity.get("average_speed", 0) * 3.6, 1),
-        "elevation_gain": activity.get("total_elevation_gain"),
-    }, on_conflict="strava_id").execute()
+    async with httpx.AsyncClient() as client:
+        await client.patch(
+            f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}",
+            json=data,
+            headers=SB_HEADERS,
+        )
+
+
+async def upsert_supabase_activity(activity: dict, user_id: str):
+    if not SUPABASE_URL:
+        return
+    disc_map = {"Run": "run", "Ride": "bike", "VirtualRide": "bike", "Swim": "swim", "WeightTraining": "gym", "Workout": "gym"}
+    headers = {**SB_HEADERS, "Prefer": "resolution=merge-duplicates"}
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            f"{SUPABASE_URL}/rest/v1/activities",
+            json={
+                "user_id": user_id,
+                "strava_id": str(activity["id"]),
+                "discipline": disc_map.get(activity.get("type", ""), "run"),
+                "title": activity.get("name", "Actividad"),
+                "date": activity.get("start_date_local", "")[:10],
+                "duration_min": round(activity.get("moving_time", 0) / 60),
+                "distance_km": round(activity.get("distance", 0) / 1000, 2),
+                "avg_hr": activity.get("average_heartrate"),
+                "max_hr": activity.get("max_heartrate"),
+                "avg_speed": round(activity.get("average_speed", 0) * 3.6, 1),
+                "elevation_gain": activity.get("total_elevation_gain"),
+            },
+            headers=headers,
+        )
 
 
 async def process_strava_activity_app(user_id: str, activity_id: int):
-    if not sb:
+    if not SUPABASE_URL:
         return
-    res = sb.table("profiles").select(
-        "strava_access_token,strava_refresh_token,strava_token_expires_at"
-    ).eq("id", user_id).execute()
-    if not res.data:
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=strava_access_token,strava_refresh_token,strava_token_expires_at",
+            headers=SB_HEADERS,
+        )
+        data = r.json()
+    if not data:
         return
-    profile = res.data[0]
+    profile = data[0]
     access_token = profile["strava_access_token"]
     if profile.get("strava_token_expires_at") and profile["strava_token_expires_at"] < time.time():
         async with httpx.AsyncClient() as client:
-            r = await client.post("https://www.strava.com/oauth/token", json={
-                "client_id": STRAVA_CLIENT_ID,
-                "client_secret": STRAVA_CLIENT_SECRET,
-                "grant_type": "refresh_token",
-                "refresh_token": profile["strava_refresh_token"],
+            r = await client.post("https://www.strava.com/oauth/token", data={
+                "client_id": STRAVA_CLIENT_ID, "client_secret": STRAVA_CLIENT_SECRET,
+                "grant_type": "refresh_token", "refresh_token": profile["strava_refresh_token"],
             })
             new_tokens = r.json()
         if "access_token" in new_tokens:
             access_token = new_tokens["access_token"]
-            sb.table("profiles").update({
+            await update_supabase_profile(user_id, {
                 "strava_access_token": new_tokens["access_token"],
                 "strava_refresh_token": new_tokens["refresh_token"],
                 "strava_token_expires_at": new_tokens["expires_at"],
-            }).eq("id", user_id).execute()
+            })
     try:
         activity = await get_activity_detail(activity_id, access_token)
-        await sync_activity_to_supabase(user_id, activity)
+        await upsert_supabase_activity(activity, user_id)
     except Exception as e:
         print(f"Error sync app activity: {e}")
 
@@ -553,21 +579,20 @@ async def app_strava_auth(user_id: str):
 @app.get("/app/strava/callback/{user_id}")
 async def app_strava_callback(user_id: str, code: str = None, error: str = None):
     if error or not code:
-        return HTMLResponse("<html><body style='background:#000;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;flex-direction:column;gap:16px;text-align:center'><div style='font-size:60px'>❌</div><h2>Autorización cancelada</h2><p style='color:#888'>Cierra esta ventana y vuelve a la app.</p></body></html>")
+        return HTMLResponse(ERROR_HTML)
     token_data = await exchange_code(code)
     if "access_token" not in token_data:
-        return HTMLResponse("<html><body style='background:#000;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;flex-direction:column;gap:16px;text-align:center'><div style='font-size:60px'>❌</div><h2>Error al conectar</h2><p style='color:#888'>Cierra esta ventana e inténtalo de nuevo.</p></body></html>")
+        return HTMLResponse(ERROR_HTML)
     athlete_id = str(token_data["athlete"]["id"])
-    if sb:
-        sb.table("profiles").update({
-            "strava_connected": True,
-            "strava_athlete_id": athlete_id,
-            "strava_access_token": token_data["access_token"],
-            "strava_refresh_token": token_data["refresh_token"],
-            "strava_token_expires_at": token_data["expires_at"],
-        }).eq("id", user_id).execute()
+    await update_supabase_profile(user_id, {
+        "strava_connected": True,
+        "strava_athlete_id": athlete_id,
+        "strava_access_token": token_data["access_token"],
+        "strava_refresh_token": token_data["refresh_token"],
+        "strava_token_expires_at": token_data["expires_at"],
+    })
     strava_user_map[f"app_{athlete_id}"] = user_id
-    return HTMLResponse("<html><body style='background:#000;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;flex-direction:column;gap:16px;text-align:center'><div style='font-size:60px'>✅</div><h2>¡Strava conectado!</h2><p style='color:#888'>Cierra esta ventana y vuelve a la app.</p></body></html>")
+    return HTMLResponse(SUCCESS_HTML)
 
 
 @app.get("/health")

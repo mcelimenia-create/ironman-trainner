@@ -6,9 +6,8 @@ sqlalchemy
 asyncpg
 psycopg2-binary
 python-dotenv
-httpx==0.24.1
+httpx
 openai
 matplotlib
 apscheduler
 tzdata
-supabase==2.3.1
