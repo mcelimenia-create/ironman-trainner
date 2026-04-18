@@ -650,3 +650,52 @@ async def app_strava_sync(user_id: str):
             print(f"Error syncing activity {activity.get('id')}: {e}")
 
     return {"synced": synced}
+
+
+# ─── AI COACHING ──────────────────────────────────────────────────────────────
+
+@app.post("/app/ai/coach/{user_id}")
+async def app_ai_coach(user_id: str, request: Request):
+    if not SUPABASE_URL:
+        return {"error": "Supabase not configured"}
+
+    body = await request.json()
+    ctl = body.get("ctl", 0)
+    atl = body.get("atl", 0)
+    tsb = body.get("tsb", 0)
+    swim_km = body.get("swim_km", 0)
+    bike_km = body.get("bike_km", 0)
+    run_km = body.get("run_km", 0)
+    hours = body.get("hours", 0)
+    race_type = body.get("race_type", "full_ironman")
+    days_to_race = body.get("days_to_race", 0)
+    next_sessions = body.get("next_sessions", [])
+
+    race_names = {"sprint": "Sprint", "olympic": "Triatlón Olímpico", "half_ironman": "Ironman 70.3", "full_ironman": "Ironman Full"}
+    race_label = race_names.get(race_type, race_type)
+
+    prompt = f"""Eres un entrenador de triatlón de élite. Analiza el estado actual del atleta y da recomendaciones concretas y personalizadas en español.
+
+DATOS DEL ATLETA:
+- Carrera objetivo: {race_label} en {days_to_race} días
+- Forma física (CTL): {ctl} TSS/día — fitness crónica acumulada
+- Fatiga (ATL): {atl} TSS/día — carga de los últimos 7 días
+- Forma (TSB): {tsb} — positivo=fresco, negativo=cansado
+- Volumen esta semana: Natación {swim_km}km · Bici {bike_km}km · Carrera {run_km}km · Total {hours}h
+- Próximas sesiones: {', '.join(next_sessions) if next_sessions else 'sin sesiones programadas'}
+
+INSTRUCCIONES:
+Responde en máximo 4 puntos concretos y accionables. Sin introducciones largas. Directo al grano. Usa emojis de forma moderada. Máximo 200 palabras."""
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        message = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        advice = message.content[0].text
+        return {"advice": advice}
+    except Exception as e:
+        return {"error": str(e)}
