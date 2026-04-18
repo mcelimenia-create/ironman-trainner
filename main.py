@@ -461,6 +461,92 @@ async def strava_webhook(request: Request, background_tasks: BackgroundTasks):
     background_tasks.add_task(process_strava_activity, user_id, activity_id)
     return {"ok": True}
 
+# ─── APP STRAVA OAUTH ─────────────────────────────────────────────────────────
+
+import time
+from supabase import create_client as create_supabase_client
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+sb = create_supabase_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_URL else None
+
+def get_supabase_user_by_athlete(athlete_id: str):
+    if not sb: return None
+    res = sb.table("profiles").select("id").eq("strava_athlete_id", athlete_id).execute()
+    return res.data[0]["id"] if res.data else None
+
+async def sync_activity_to_supabase(user_id: str, activity: dict):
+    if not sb: return
+    disc_map = {"Run":"run","Ride":"bike","VirtualRide":"bike","Swim":"swim","WeightTraining":"gym","Workout":"gym"}
+    sb.table("activities").upsert({
+        "user_id": user_id,
+        "strava_id": str(activity["id"]),
+        "discipline": disc_map.get(activity.get("type",""), "run"),
+        "title": activity.get("name", "Actividad"),
+        "date": activity.get("start_date_local","")[:10],
+        "duration_min": round(activity.get("moving_time", 0) / 60),
+        "distance_km": round(activity.get("distance", 0) / 1000, 2),
+        "avg_hr": activity.get("average_heartrate"),
+        "max_hr": activity.get("max_heartrate"),
+        "avg_speed": round(activity.get("average_speed", 0) * 3.6, 1),
+        "elevation_gain": activity.get("total_elevation_gain"),
+    }, on_conflict="strava_id").execute()
+
+async def process_strava_activity_app(user_id: str, activity_id: int):
+    if not sb: return
+    res = sb.table("profiles").select("strava_access_token,strava_refresh_token,strava_token_expires_at").eq("id", user_id).execute()
+    if not res.data: return
+    profile = res.data[0]
+    access_token = profile["strava_access_token"]
+    if profile["strava_token_expires_at"] and profile["strava_token_expires_at"] < time.time():
+        async with httpx.AsyncClient() as client:
+            r = await client.post("https://www.strava.com/oauth/token", json={
+                "client_id": STRAVA_CLIENT_ID, "client_secret": STRAVA_CLIENT_SECRET,
+                "grant_type": "refresh_token", "refresh_token": profile["strava_refresh_token"],
+            })
+            new_tokens = r.json()
+        if "access_token" in new_tokens:
+            access_token = new_tokens["access_token"]
+            sb.table("profiles").update({
+                "strava_access_token": new_tokens["access_token"],
+                "strava_refresh_token": new_tokens["refresh_token"],
+                "strava_token_expires_at": new_tokens["expires_at"],
+            }).eq("id", user_id).execute()
+    try:
+        activity = await get_activity_detail(activity_id, access_token)
+        await sync_activity_to_supabase(user_id, activity)
+    except Exception as e:
+        print(f"Error sync app activity: {e}")
+
+@app.get("/app/strava/auth/{user_id}")
+async def app_strava_auth(user_id: str):
+    auth_url = (
+        f"https://www.strava.com/oauth/authorize"
+        f"?client_id={STRAVA_CLIENT_ID}"
+        f"&redirect_uri={BASE_URL}/app/strava/callback/{user_id}"
+        f"&response_type=code&scope=activity:read_all"
+    )
+    return RedirectResponse(auth_url)
+
+@app.get("/app/strava/callback/{user_id}")
+async def app_strava_callback(user_id: str, code: str = None, error: str = None, background_tasks: BackgroundTasks = None):
+    if error or not code:
+        return RedirectResponse("ironmantrainer://strava-error")
+    token_data = await exchange_code(code)
+    if "access_token" not in token_data:
+        return RedirectResponse("ironmantrainer://strava-error")
+    athlete_id = str(token_data["athlete"]["id"])
+    if sb:
+        sb.table("profiles").update({
+            "strava_connected": True,
+            "strava_athlete_id": athlete_id,
+            "strava_access_token": token_data["access_token"],
+            "strava_refresh_token": token_data["refresh_token"],
+            "strava_token_expires_at": token_data["expires_at"],
+        }).eq("id", user_id).execute()
+    strava_user_map[f"app_{athlete_id}"] = user_id
+    return RedirectResponse("ironmantrainer://strava-connected")
+
 
 @app.get("/health")
 def health():
