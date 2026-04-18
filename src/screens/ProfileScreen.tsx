@@ -4,7 +4,6 @@ import {
   Alert, Modal, Platform, ActivityIndicator, TextInput, KeyboardAvoidingView,
 } from 'react-native';
 import * as WebBrowser from 'expo-web-browser';
-import * as Linking from 'expo-linking';
 import DateTimePicker from '@react-native-community/datetimepicker';
 import { Ionicons } from '@expo/vector-icons';
 import { useNavigation } from '@react-navigation/native';
@@ -35,20 +34,12 @@ export default function ProfileScreen() {
   const [thresholdModal, setThresholdModal] = useState<{ field: string; label: string; unit: string; value: string } | null>(null);
   const [thresholdInput, setThresholdInput] = useState('');
 
-  useEffect(() => {
-    const sub = Linking.addEventListener('url', ({ url }) => {
-      if (url.includes('strava-connected')) {
-        refresh();
-        Alert.alert('¡Strava conectado!', 'Tus actividades se sincronizarán automáticamente.');
-      }
-    });
-    return () => sub.remove();
-  }, []);
-
   const connectStrava = async () => {
     if (!session) return;
     const authUrl = `https://ironman-trainner-production.up.railway.app/app/strava/auth/${session.user.id}`;
-    await WebBrowser.openAuthSessionAsync(authUrl, 'ironmantrainer://');
+    await WebBrowser.openBrowserAsync(authUrl);
+    // Al volver, refrescamos el perfil para ver si se conectó
+    refresh();
   };
 
   const openThreshold = (field: string, label: string, unit: string, current?: number) => {
