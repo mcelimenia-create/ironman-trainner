@@ -669,38 +669,98 @@ async def app_ai_coach(user_id: str, request: Request):
     hours = body.get("hours", 0)
     race_type = body.get("race_type", "full_ironman")
     days_to_race = body.get("days_to_race", 0)
-    next_sessions = body.get("next_sessions", [])
 
     race_names = {"sprint": "Sprint", "olympic": "Triatlón Olímpico", "half_ironman": "Ironman 70.3", "full_ironman": "Ironman Full"}
     race_label = race_names.get(race_type, race_type)
 
-    prompt = f"""Eres un entrenador de triatlón de élite. Analiza el estado actual del atleta y da recomendaciones concretas y personalizadas en español.
+    # Fetch upcoming 7 sessions from Supabase
+    upcoming_sessions = []
+    try:
+        today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        week_later = (datetime.now(timezone.utc) + timedelta(days=8)).strftime('%Y-%m-%d')
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/training_sessions"
+                f"?user_id=eq.{user_id}&date=gte.{today}&date=lte.{week_later}"
+                f"&completed=eq.false&order=date.asc&limit=8"
+                f"&select=id,date,discipline,title,duration_min,distance_km,tss",
+                headers=SB_HEADERS,
+            )
+            if r.status_code == 200:
+                upcoming_sessions = r.json() if isinstance(r.json(), list) else []
+    except Exception:
+        pass
+
+    sessions_block = ""
+    for s in upcoming_sessions:
+        line = f'  - id:{s["id"]} | {s["date"]} | {s["discipline"]} | {s["title"]} | {s["duration_min"]}min'
+        if s.get("distance_km"):
+            line += f' | {s["distance_km"]}km'
+        if s.get("tss"):
+            line += f' | TSS {s["tss"]}'
+        sessions_block += line + "\n"
+    if not sessions_block:
+        sessions_block = "  (sin sesiones pendientes esta semana)"
+
+    prompt = f"""Eres un entrenador de triatlón de élite. Analiza el estado del atleta y devuelve ÚNICAMENTE un objeto JSON válido, sin texto adicional antes ni después.
 
 DATOS DEL ATLETA:
-- Carrera objetivo: {race_label} en {days_to_race} días
-- Forma física (CTL): {ctl} TSS/día — fitness crónica acumulada
-- Fatiga (ATL): {atl} TSS/día — carga de los últimos 7 días
-- Forma (TSB): {tsb} — positivo=fresco, negativo=cansado
-- Volumen esta semana: Natación {swim_km}km · Bici {bike_km}km · Carrera {run_km}km · Total {hours}h
-- Próximas sesiones: {', '.join(next_sessions) if next_sessions else 'sin sesiones programadas'}
+- Carrera: {race_label} en {days_to_race} días
+- CTL (fitness crónica): {ctl} TSS/día
+- ATL (fatiga aguda): {atl} TSS/día
+- TSB (forma): {tsb}  →  >10=fresco  0-10=en forma  -10-0=algo cansado  <-10=muy cargado
+- Volumen esta semana: Natación {swim_km}km · Bici {bike_km}km · Carrera {run_km}km · {hours}h total
 
-INSTRUCCIONES:
-- Responde en exactamente 3-4 puntos numerados (1. 2. 3. 4.)
-- Cada punto en una línea separada
-- Sin asteriscos, sin markdown, sin negritas, sin guiones
-- Sin introducción ni cierre, ve directo a los puntos
-- Usa un emoji al inicio de cada punto
-- Máximo 180 palabras en total"""
+SESIONES PENDIENTES PRÓXIMOS 7 DÍAS:
+{sessions_block}
+
+RESPONDE EXACTAMENTE CON ESTE JSON (sin texto fuera del JSON):
+{{
+  "advice": [
+    "🔥 Frase 1 concreta sin markdown",
+    "📊 Frase 2 concreta",
+    "💡 Frase 3 concreta"
+  ],
+  "suggestions": [
+    {{
+      "session_id": "el-id-exacto-de-la-sesion",
+      "date": "YYYY-MM-DD",
+      "original_title": "título actual",
+      "new_title": "nuevo título",
+      "new_duration_min": 45,
+      "new_description": "descripción breve de la sesión ajustada",
+      "change_type": "reduce" | "increase" | "swap_rest" | "keep",
+      "reason": "razón corta del cambio"
+    }}
+  ]
+}}
+
+REGLAS:
+- advice: exactamente 3 frases cortas, con emoji al inicio, sin asteriscos ni markdown
+- suggestions: SOLO incluir sesiones que realmente necesiten cambio (0-3 máximo)
+- Si TSB < -10: reducir duración o convertir a descanso las sesiones duras
+- Si TSB > 10 y faltan >30 días: puedes aumentar ligeramente
+- Si el atleta está bien, suggestions puede ser []
+- Usa los id exactos de las sesiones listadas arriba"""
 
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
-        message = client.messages.create(
+        import anthropic, json as _json
+        ai_client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        message = ai_client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=400,
+            max_tokens=800,
             messages=[{"role": "user", "content": prompt}]
         )
-        advice = message.content[0].text
-        return {"advice": advice}
+        raw = message.content[0].text.strip()
+        # Extract JSON if wrapped in code block
+        if "```" in raw:
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        result = _json.loads(raw)
+        return {
+            "advice": result.get("advice", []),
+            "suggestions": result.get("suggestions", []),
+        }
     except Exception as e:
         return {"error": str(e)}
