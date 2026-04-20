@@ -1599,3 +1599,263 @@ async def app_nutrition_today(user_id: str):
         "intensity_label": intensity_label,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+# ─── SOCIAL / TRIBE ───────────────────────────────────────────────────────────
+
+_CTL_K = 0.02352  # 1 - exp(-1/42)
+
+def _compute_ctl(activities: list) -> int:
+    if not activities:
+        return 0
+    acts_sorted = sorted(activities, key=lambda a: (a.get("date") or "")[:10])
+    ctl = 0.0
+    for a in acts_sorted:
+        tss = a.get("tss") or round((a.get("duration_min") or 0) * 0.8)
+        ctl += _CTL_K * (tss - ctl)
+    return round(ctl)
+
+
+@app.get("/app/social/groups/{user_id}")
+async def social_groups(user_id: str):
+    async with httpx.AsyncClient() as client:
+        pr = await client.get(
+            f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=race_type",
+            headers=SB_HEADERS,
+        )
+    race_type = (pr.json()[0].get("race_type") or "full_ironman") if pr.json() else "full_ironman"
+
+    async with httpx.AsyncClient() as client:
+        mem_r, sug_r = await asyncio.gather(
+            client.get(
+                f"{SUPABASE_URL}/rest/v1/race_group_members?user_id=eq.{user_id}&select=group_id,goal_time,joined_at",
+                headers=SB_HEADERS,
+            ),
+            client.get(
+                f"{SUPABASE_URL}/rest/v1/race_groups?race_type=eq.{race_type}&order=member_count.desc&limit=20",
+                headers=SB_HEADERS,
+            ),
+        )
+
+    memberships = mem_r.json() if isinstance(mem_r.json(), list) else []
+    all_groups  = sug_r.json() if isinstance(sug_r.json(), list) else []
+    my_ids = {m["group_id"] for m in memberships if isinstance(m, dict)}
+
+    my_groups        = [g for g in all_groups if isinstance(g, dict) and g.get("id") in my_ids]
+    suggested_groups = [g for g in all_groups if isinstance(g, dict) and g.get("id") not in my_ids][:6]
+
+    # Attach goal_time to my_groups
+    gmap = {m["group_id"]: m.get("goal_time") for m in memberships if isinstance(m, dict)}
+    for g in my_groups:
+        g["goal_time"] = gmap.get(g["id"])
+
+    return {"my_groups": my_groups, "suggested_groups": suggested_groups, "race_type": race_type}
+
+
+@app.post("/app/social/groups/join")
+async def social_groups_join(body: dict):
+    user_id  = body.get("user_id")
+    group_id = body.get("group_id")
+    goal_time = body.get("goal_time")
+
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            f"{SUPABASE_URL}/rest/v1/race_group_members",
+            json={"user_id": user_id, "group_id": group_id, "goal_time": goal_time},
+            headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates"},
+        )
+        gr = await client.get(
+            f"{SUPABASE_URL}/rest/v1/race_groups?id=eq.{group_id}&select=member_count",
+            headers=SB_HEADERS,
+        )
+        groups = gr.json()
+        if isinstance(groups, list) and groups:
+            count = (groups[0].get("member_count") or 0) + 1
+            await client.patch(
+                f"{SUPABASE_URL}/rest/v1/race_groups?id=eq.{group_id}",
+                json={"member_count": count},
+                headers=SB_HEADERS,
+            )
+    return {"ok": True}
+
+
+@app.get("/app/social/group/{group_id}/members")
+async def social_group_members(group_id: str):
+    async with httpx.AsyncClient() as client:
+        members_r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/race_group_members?group_id=eq.{group_id}&select=user_id,goal_time,joined_at",
+            headers=SB_HEADERS,
+        )
+    members = members_r.json() if isinstance(members_r.json(), list) else []
+    if not members:
+        return {"members": []}
+
+    user_ids = [m["user_id"] for m in members if isinstance(m, dict)]
+    ids_str  = ",".join(user_ids)
+    forty_two_ago = (datetime.now(timezone.utc) - timedelta(days=42)).strftime("%Y-%m-%d")
+
+    async with httpx.AsyncClient() as client:
+        profiles_r, acts_r = await asyncio.gather(
+            client.get(f"{SUPABASE_URL}/rest/v1/profiles?id=in.({ids_str})&select=id,name", headers=SB_HEADERS),
+            client.get(f"{SUPABASE_URL}/rest/v1/activities?user_id=in.({ids_str})&date=gte.{forty_two_ago}&select=user_id,date,tss,duration_min", headers=SB_HEADERS),
+        )
+
+    profiles = {p["id"]: p for p in (profiles_r.json() or []) if isinstance(p, dict)}
+    acts_by_user: dict = {}
+    for a in (acts_r.json() or []):
+        if isinstance(a, dict):
+            acts_by_user.setdefault(a["user_id"], []).append(a)
+
+    result = []
+    for m in members:
+        if not isinstance(m, dict):
+            continue
+        uid  = m["user_id"]
+        name = profiles.get(uid, {}).get("name", "Atleta")
+        ctl  = _compute_ctl(acts_by_user.get(uid, []))
+        result.append({"user_id": uid, "name": name, "goal_time": m.get("goal_time"), "ctl": ctl, "joined_at": m.get("joined_at")})
+
+    result.sort(key=lambda x: x["ctl"], reverse=True)
+    return {"members": result}
+
+
+@app.get("/app/social/leaderboard/{user_id}")
+async def social_leaderboard(user_id: str):
+    async with httpx.AsyncClient() as client:
+        pr = await client.get(
+            f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=race_type",
+            headers=SB_HEADERS,
+        )
+    race_type = (pr.json()[0].get("race_type") or "full_ironman") if pr.json() else "full_ironman"
+
+    async with httpx.AsyncClient() as client:
+        profiles_r, gami_r = await asyncio.gather(
+            client.get(f"{SUPABASE_URL}/rest/v1/profiles?race_type=eq.{race_type}&select=id,name&limit=100", headers=SB_HEADERS),
+            client.get(f"{SUPABASE_URL}/rest/v1/user_gamification?select=user_id,xp_total,streak_days,level_name,level_emoji,last_activity_date&limit=200", headers=SB_HEADERS),
+        )
+
+    profiles  = [p for p in (profiles_r.json() or []) if isinstance(p, dict)]
+    gami_map  = {g["user_id"]: g for g in (gami_r.json() or []) if isinstance(g, dict)}
+    user_ids  = [p["id"] for p in profiles]
+
+    acts_by_user: dict = {}
+    if user_ids:
+        forty_two_ago = (datetime.now(timezone.utc) - timedelta(days=42)).strftime("%Y-%m-%d")
+        ids_str = ",".join(user_ids[:50])
+        async with httpx.AsyncClient() as client:
+            ar = await client.get(
+                f"{SUPABASE_URL}/rest/v1/activities?user_id=in.({ids_str})&date=gte.{forty_two_ago}&select=user_id,date,tss,duration_min&limit=5000",
+                headers=SB_HEADERS,
+            )
+        for a in (ar.json() or []):
+            if isinstance(a, dict):
+                acts_by_user.setdefault(a["user_id"], []).append(a)
+
+    entries = []
+    for p in profiles:
+        uid = p.get("id")
+        g   = gami_map.get(uid, {})
+        entries.append({
+            "user_id":     uid,
+            "name":        p.get("name", "Atleta"),
+            "xp_total":    g.get("xp_total", 0) or 0,
+            "level_name":  g.get("level_name", "Rookie"),
+            "level_emoji": g.get("level_emoji", "🥉"),
+            "streak_days": g.get("streak_days", 0) or 0,
+            "ctl":         _compute_ctl(acts_by_user.get(uid, [])),
+            "is_me":       uid == user_id,
+        })
+
+    entries.sort(key=lambda e: e["xp_total"], reverse=True)
+    for i, e in enumerate(entries):
+        e["position"] = i + 1
+
+    my_entry = next((e for e in entries if e["is_me"]), None)
+    top20    = entries[:20]
+
+    return {
+        "leaderboard":    top20,
+        "my_position":    my_entry["position"] if my_entry else None,
+        "my_entry":       my_entry,
+        "race_type":      race_type,
+        "total_athletes": len(entries),
+    }
+
+
+@app.post("/app/social/rival/challenge")
+async def rival_challenge(body: dict):
+    challenger_id = body.get("challenger_id")
+    challenged_id = body.get("challenged_id")
+
+    today      = datetime.now(timezone.utc).date()
+    week_start = today - timedelta(days=today.weekday())
+
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"{SUPABASE_URL}/rest/v1/rival_challenges",
+            json={
+                "challenger_id": challenger_id,
+                "challenged_id": challenged_id,
+                "week_start":    week_start.isoformat(),
+                "status":        "active",
+            },
+            headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=representation"},
+        )
+    data = r.json()
+    if isinstance(data, list) and data:
+        return data[0]
+    if isinstance(data, dict) and not data.get("code"):
+        return data
+    return {"ok": True, "week_start": week_start.isoformat()}
+
+
+@app.get("/app/social/rival/active/{user_id}")
+async def rival_active(user_id: str):
+    today      = datetime.now(timezone.utc).date()
+    week_start = today - timedelta(days=today.weekday())
+
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/rival_challenges"
+            f"?or=(challenger_id.eq.{user_id},challenged_id.eq.{user_id})"
+            f"&status=eq.active&order=created_at.desc&limit=1",
+            headers=SB_HEADERS,
+        )
+    challenges = r.json() if isinstance(r.json(), list) else []
+    if not challenges:
+        return {"challenge": None}
+
+    ch             = challenges[0]
+    challenger_id  = ch["challenger_id"]
+    challenged_id  = ch["challenged_id"]
+
+    async with httpx.AsyncClient() as client:
+        p1r, p2r, a1r, a2r = await asyncio.gather(
+            client.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{challenger_id}&select=name", headers=SB_HEADERS),
+            client.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{challenged_id}&select=name", headers=SB_HEADERS),
+            client.get(f"{SUPABASE_URL}/rest/v1/activities?user_id=eq.{challenger_id}&date=gte.{week_start}&select=tss,duration_min", headers=SB_HEADERS),
+            client.get(f"{SUPABASE_URL}/rest/v1/activities?user_id=eq.{challenged_id}&date=gte.{week_start}&select=tss,duration_min", headers=SB_HEADERS),
+        )
+
+    def _week_tss(acts):
+        total = 0
+        for a in (acts if isinstance(acts, list) else []):
+            total += (a.get("tss") or 0) or round((a.get("duration_min") or 0) * 0.8)
+        return round(total)
+
+    days_left      = 6 - today.weekday()  # Mon=0 → Sun=6
+    challenger_tss = _week_tss(a1r.json())
+    challenged_tss = _week_tss(a2r.json())
+
+    return {
+        "challenge": {
+            **ch,
+            "challenger_name": (p1r.json()[0].get("name") or "Atleta") if p1r.json() else "Atleta",
+            "challenged_name": (p2r.json()[0].get("name") or "Atleta") if p2r.json() else "Atleta",
+            "challenger_tss":  challenger_tss,
+            "challenged_tss":  challenged_tss,
+            "days_left":       days_left,
+            "week_start":      week_start.isoformat(),
+            "is_challenger":   challenger_id == user_id,
+        }
+    }
