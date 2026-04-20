@@ -1434,3 +1434,168 @@ async def app_race_predict(user_id: str):
         "days_to_race": days_to_race,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+# ─── NUTRITION ────────────────────────────────────────────────────────────────
+
+@app.get("/app/nutrition/today/{user_id}")
+async def app_nutrition_today(user_id: str):
+    """Generate personalized nutrition plan adapted to today's training session."""
+    if not SUPABASE_URL:
+        return {"error": "Supabase not configured"}
+
+    import anthropic as _anthropic, json as _json, re as _re
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        profile_r, session_r, wellness_r = await asyncio.gather(
+            client.get(
+                f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}"
+                f"&select=name,weight_kg,level,race_type",
+                headers=SB_HEADERS,
+            ),
+            client.get(
+                f"{SUPABASE_URL}/rest/v1/training_sessions?user_id=eq.{user_id}&date=eq.{today}"
+                f"&order=created_at.asc&limit=1"
+                f"&select=discipline,title,description,duration_min,tss",
+                headers=SB_HEADERS,
+            ),
+            client.get(
+                f"{SUPABASE_URL}/rest/v1/wellness_logs?user_id=eq.{user_id}&date=eq.{today}&select=energy_level,muscle_soreness,sleep_quality",
+                headers=SB_HEADERS,
+            ),
+        )
+
+    profile  = (profile_r.json()  or [{}])[0]
+    sessions = session_r.json()   or []
+    session  = sessions[0]        if sessions else None
+    wellness = (wellness_r.json() or [None])[0]
+
+    weight       = profile.get("weight_kg") or 75
+    discipline   = (session.get("discipline", "rest") if session else "rest")
+    description  = ((session.get("description", "") or "") if session else "").lower()
+    duration_min = (session.get("duration_min", 0)   if session else 0)
+
+    # ── Classify session intensity ────────────────────────────────────────────
+    is_rest     = discipline == "rest" or not session
+    is_gym      = discipline == "gym"
+    is_long     = duration_min >= 90
+    is_brick    = discipline == "brick"
+    is_interval = bool(_re.search(r'\d+\s*[x×]', description))
+    is_z4_z5    = bool(_re.search(r'z[45]|zona\s*[45]|umbral|series|lactato|vo2|rpe\s*[89]', description))
+    is_z1_z2    = bool(_re.search(r'z[12]|zona\s*[12]|suave|recuperaci|rodaje', description))
+
+    if is_rest:
+        carbs_per_kg, kcal_per_kg, intensity_label = 3.0, 30, "Día de descanso"
+    elif is_gym:
+        carbs_per_kg, kcal_per_kg, intensity_label = 3.5, 33, "Sesión de fuerza"
+    elif is_long or is_brick:
+        carbs_per_kg, kcal_per_kg = 6.0, 42
+        intensity_label = "Sesión larga (brick)" if is_brick else "Sesión de larga duración"
+    elif is_interval or is_z4_z5:
+        carbs_per_kg, kcal_per_kg, intensity_label = 5.5, 40, "Intervalos / Alta intensidad"
+    elif is_z1_z2:
+        carbs_per_kg, kcal_per_kg, intensity_label = 4.0, 35, "Sesión suave Z1-Z2"
+    else:
+        carbs_per_kg, kcal_per_kg, intensity_label = 4.5, 37, "Sesión moderada Z3"
+
+    if duration_min > 60:
+        kcal_per_kg += (duration_min - 60) / 30 * 1.5
+
+    protein_g = round(weight * 1.9)
+    carbs_g   = round(weight * carbs_per_kg)
+    calories  = round(weight * kcal_per_kg)
+    fat_g     = max(50, round((calories - (carbs_g * 4 + protein_g * 4)) / 9))
+    calories  = round(carbs_g * 4 + protein_g * 4 + fat_g * 9)
+
+    # Wellness adjustments
+    energy   = (wellness.get("energy_level", 3)    if wellness else 3)
+    soreness = (wellness.get("muscle_soreness", 1) if wellness else 1)
+    if energy <= 2:
+        carbs_g  = round(carbs_g  * 1.1)
+        calories = round(carbs_g * 4 + protein_g * 4 + fat_g * 9)
+
+    session_context = f"{session['title']} · {duration_min}min" if session and session.get("title") else (
+        f"{discipline.capitalize()} · {duration_min}min" if session else "Día de descanso"
+    )
+
+    # ── Supplements ───────────────────────────────────────────────────────────
+    supplements = [
+        {"name": "Vitamina D3",          "dose": "2000 UI", "timing": "Con el desayuno",         "icon": "sunny-outline"},
+        {"name": "Omega-3",              "dose": "1g EPA+DHA","timing": "Con la comida principal","icon": "water-outline"},
+        {"name": "Proteína en polvo",    "dose": "30g",     "timing": "Post-entreno (30 min)",    "icon": "fitness-outline"},
+        {"name": "Magnesio glicinato",   "dose": "400mg",   "timing": "Antes de dormir",          "icon": "moon-outline"},
+    ]
+    if is_gym:
+        supplements.insert(2, {"name": "Creatina monohidrato", "dose": "5g", "timing": "Post-entreno con agua", "icon": "barbell-outline"})
+    if is_long or is_brick:
+        supplements.insert(2, {"name": "Electrolitos",         "dose": "1 tableta/hora", "timing": "Durante el entrenamiento", "icon": "pulse-outline"})
+
+    # ── Claude meal plan ──────────────────────────────────────────────────────
+    meals = []
+    try:
+        ai_client = _anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        prompt = (
+            f"Eres nutricionista deportivo especialista en triatlón. Genera un plan de comidas personalizado.\n\n"
+            f"ATLETA:\n"
+            f"- Peso: {weight}kg · Nivel: {profile.get('level','intermedio')}\n"
+            f"- Sesión de hoy: {session_context} ({intensity_label})\n"
+            f"- Energía matutina: {energy}/5{' ⚠️ baja' if energy <= 2 else ''}\n"
+            f"- Dolor muscular: {soreness}/5{' ⚠️ alto' if soreness >= 4 else ''}\n\n"
+            f"OBJETIVOS: {calories} kcal · {carbs_g}g carbs · {protein_g}g proteína · {fat_g}g grasa\n\n"
+            f"Devuelve SOLO JSON válido (sin texto fuera) con exactamente 4 comidas:\n"
+            f'{{"meals":['
+            f'{{"type":"breakfast","time":"07:30","name":"...","foods":[{{"name":"...","amount_g":80,"notes":"opcional"}}],"calories":0,"carbs_g":0,"protein_g":0,"fat_g":0,"tip":"consejo breve (opcional)"}},'
+            f'{{"type":"pre_workout","time":"10:00",...}},'
+            f'{{"type":"post_workout","time":"12:30",...}},'
+            f'{{"type":"dinner","time":"20:00",...}}'
+            f']}}\n\n'
+            f"REGLAS: alimentos reales con gramos exactos · pre-entreno fácil digestión y carbos · "
+            f"post-entreno proteína+carbos en 30-60min · macros totales ≈ objetivos · español"
+        )
+        msg = ai_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1800,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = msg.content[0].text.strip()
+        if "```" in raw:
+            raw = raw.split("```")[1]
+            if raw.startswith("json"): raw = raw[4:]
+        meals = _json.loads(raw).get("meals", [])
+    except Exception:
+        q = calories // 4
+        meals = [
+            {"type": "breakfast",   "time": "07:30", "name": "Desayuno",
+             "foods": [{"name": "Avena", "amount_g": 80}, {"name": "Plátano", "amount_g": 120}, {"name": "Huevos revueltos", "amount_g": 150}],
+             "calories": round(q * 1.05), "carbs_g": round(carbs_g * 0.30), "protein_g": round(protein_g * 0.25), "fat_g": round(fat_g * 0.30)},
+            {"type": "pre_workout", "time": "10:00", "name": "Pre-entreno",
+             "foods": [{"name": "Plátano", "amount_g": 120}, {"name": "Arroz con miel", "amount_g": 100}],
+             "calories": round(q * 0.60), "carbs_g": round(carbs_g * 0.25), "protein_g": round(protein_g * 0.08), "fat_g": round(fat_g * 0.05)},
+            {"type": "post_workout","time": "12:30", "name": "Post-entreno",
+             "foods": [{"name": "Batido de proteína", "amount_g": 30}, {"name": "Arroz blanco", "amount_g": 200}, {"name": "Pechuga de pollo", "amount_g": 150}],
+             "calories": round(q * 1.05), "carbs_g": round(carbs_g * 0.25), "protein_g": round(protein_g * 0.40), "fat_g": round(fat_g * 0.20)},
+            {"type": "dinner",      "time": "20:00", "name": "Cena",
+             "foods": [{"name": "Salmón", "amount_g": 180}, {"name": "Boniato asado", "amount_g": 200}, {"name": "Ensalada", "amount_g": 100}],
+             "calories": round(q * 1.30), "carbs_g": round(carbs_g * 0.20), "protein_g": round(protein_g * 0.27), "fat_g": round(fat_g * 0.45)},
+        ]
+
+    # ── Upsert to Supabase ────────────────────────────────────────────────────
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            f"{SUPABASE_URL}/rest/v1/nutrition_plans",
+            json={"user_id": user_id, "date": today, "session_type": intensity_label,
+                  "calories": calories, "carbs_g": carbs_g, "protein_g": protein_g,
+                  "fat_g": fat_g, "meals": meals, "supplements": supplements},
+            headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates"},
+        )
+
+    return {
+        "calories": calories, "carbs_g": carbs_g,
+        "protein_g": protein_g, "fat_g": fat_g,
+        "meals": meals, "supplements": supplements,
+        "session_context": session_context,
+        "intensity_label": intensity_label,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
