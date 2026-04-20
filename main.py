@@ -1155,3 +1155,176 @@ async def clear_coach_conversation(user_id: str):
             headers=SB_HEADERS,
         )
     return {"ok": True}
+
+
+# ─── RACE SIMULATOR ───────────────────────────────────────────────────────────
+
+@app.get("/app/race/predict/{user_id}")
+async def app_race_predict(user_id: str):
+    """Compute per-segment race prediction + Claude narrative from athlete data."""
+    if not SUPABASE_URL:
+        return {"error": "Supabase not configured"}
+
+    import anthropic as _anthropic
+
+    # Fetch profile + activities in parallel
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        profile_r, activities_r = await asyncio.gather(
+            client.get(
+                f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}"
+                f"&select=name,race_type,race_date,ftp,swim_css_sec,run_threshold_pace_sec,weight_kg,max_hr",
+                headers=SB_HEADERS,
+            ),
+            client.get(
+                f"{SUPABASE_URL}/rest/v1/activities?user_id=eq.{user_id}"
+                f"&order=date.asc&limit=300&select=date,tss",
+                headers=SB_HEADERS,
+            ),
+        )
+
+    profile = (profile_r.json() or [{}])[0]
+    activities_raw = activities_r.json() if activities_r.status_code == 200 and isinstance(activities_r.json(), list) else []
+
+    # ── Compute CTL / ATL / TSB via EMA ──────────────────────────────────────
+    ctl_alpha = 2 / 43  # 42-day
+    atl_alpha = 2 / 8   # 7-day
+    ctl = 0.0
+    atl = 0.0
+
+    tss_by_date: dict = {}
+    for a in activities_raw:
+        d = (a.get("date") or "")[:10]
+        tss_by_date[d] = tss_by_date.get(d, 0) + (a.get("tss") or 0)
+
+    if tss_by_date:
+        from datetime import date as _date
+        start = datetime.strptime(sorted(tss_by_date)[0], "%Y-%m-%d").date()
+        end = datetime.now().date()
+        cur = start
+        while cur <= end:
+            ds = cur.strftime("%Y-%m-%d")
+            daily = tss_by_date.get(ds, 0)
+            ctl = ctl + ctl_alpha * (daily - ctl)
+            atl = atl + atl_alpha * (daily - atl)
+            cur += timedelta(days=1)
+
+    ctl = round(ctl, 1)
+    atl = round(atl, 1)
+    tsb = round(ctl - atl, 1)
+
+    # ── Race prediction (port of racePredictor.ts) ────────────────────────────
+    DISTANCES = {
+        "sprint":       {"swim": 0.75,  "bike": 20,   "run": 5    },
+        "olympic":      {"swim": 1.5,   "bike": 40,   "run": 10   },
+        "half_ironman": {"swim": 1.9,   "bike": 90,   "run": 21.1 },
+        "full_ironman": {"swim": 3.8,   "bike": 180,  "run": 42.2 },
+    }
+    T1_T2 = {
+        "sprint":       {"t1": 2,  "t2": 1},
+        "olympic":      {"t1": 3,  "t2": 2},
+        "half_ironman": {"t1": 5,  "t2": 3},
+        "full_ironman": {"t1": 7,  "t2": 5},
+    }
+    RACE_NAMES = {
+        "sprint": "Sprint", "olympic": "Triatlón Olímpico",
+        "half_ironman": "Ironman 70.3", "full_ironman": "Ironman Full",
+    }
+
+    race_type = profile.get("race_type") or "full_ironman"
+    dist = DISTANCES.get(race_type, DISTANCES["full_ironman"])
+    trans = T1_T2.get(race_type, T1_T2["full_ironman"])
+    missing = 0
+
+    swim_css = profile.get("swim_css_sec")
+    if swim_css:
+        pace_per_km_sec = (swim_css / 100) * 1000 * 1.08
+        swim_min = (dist["swim"] * pace_per_km_sec) / 60
+    else:
+        swim_min = dist["swim"] * 10 * 2
+        missing += 1
+
+    ftp = profile.get("ftp")
+    weight_kg = profile.get("weight_kg")
+    if ftp:
+        race_pct = {"sprint": 0.85, "olympic": 0.80, "half_ironman": 0.75, "full_ironman": 0.70}.get(race_type, 0.70)
+        wkg = (ftp * race_pct) / weight_kg if weight_kg else 3.2
+        bike_min = (dist["bike"] / (8 + wkg * 7)) * 60
+    else:
+        default_speed = {"sprint": 28, "olympic": 30, "half_ironman": 30, "full_ironman": 28}.get(race_type, 28)
+        bike_min = (dist["bike"] / default_speed) * 60
+        missing += 1
+
+    run_pace = profile.get("run_threshold_pace_sec")
+    if run_pace:
+        fatigue = {"sprint": 1.02, "olympic": 1.05, "half_ironman": 1.12, "full_ironman": 1.22}.get(race_type, 1.22)
+        ctl_bonus = min(0.05, (ctl - 40) * 0.001) if ctl > 40 else 0
+        run_min = (dist["run"] * run_pace * (fatigue - ctl_bonus)) / 60
+    else:
+        run_min = dist["run"] * 5.5
+        missing += 1
+
+    confidence = "high" if missing == 0 else ("medium" if missing == 1 else "low")
+    confidence_pct = {"high": 90, "medium": 70, "low": 40}[confidence]
+
+    t1_min = trans["t1"]
+    t2_min = trans["t2"]
+    total_min = swim_min + t1_min + bike_min + t2_min + run_min
+
+    def fmt_min(m: float) -> str:
+        h = int(m // 60)
+        mn = round(m % 60)
+        return f"{h}h {str(mn).zfill(2)}min" if h > 0 else f"{mn}min"
+
+    days_to_race = None
+    if profile.get("race_date"):
+        try:
+            rd = datetime.strptime(profile["race_date"], "%Y-%m-%d")
+            days_to_race = max(0, (rd - datetime.now()).days)
+        except Exception:
+            pass
+
+    race_label = RACE_NAMES.get(race_type, race_type)
+
+    # ── Claude narrative ──────────────────────────────────────────────────────
+    narrative = f"Predicción basada en tus umbrales actuales. CTL {ctl} TSS/día indica tu base de fitness crónico."
+    try:
+        ai_client = _anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        nar_prompt = (
+            f"Eres el Race Simulator de TriRace. Genera un análisis narrativo de 2-3 frases sobre esta predicción.\n\n"
+            f"Datos del atleta:\n"
+            f"- Carrera: {race_label} ({days_to_race or '?'} días)\n"
+            f"- Predicción: Natación {round(swim_min)}min · T1 {t1_min}min · Bici {round(bike_min)}min · T2 {t2_min}min · Carrera {round(run_min)}min = {fmt_min(total_min)} total\n"
+            f"- CTL: {ctl} · ATL: {atl} · TSB: {tsb}\n"
+            f"- FTP: {ftp or 'no configurado'}W · CSS: {swim_css or 'no configurado'}s/100m · Umbral carrera: {run_pace or 'no configurado'}s/km\n"
+            f"- Confianza: {confidence} ({confidence_pct}%)\n\n"
+            f"Responde en español, 2-3 frases, sin markdown, sin emoji. "
+            f"Identifica el factor limitante principal y qué mejoraría más el tiempo final."
+        )
+        msg = ai_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            messages=[{"role": "user", "content": nar_prompt}],
+        )
+        narrative = msg.content[0].text.strip()
+    except Exception:
+        pass
+
+    return {
+        "swim": round(swim_min),
+        "t1": t1_min,
+        "bike": round(bike_min),
+        "t2": t2_min,
+        "run": round(run_min),
+        "total": round(total_min),
+        "total_formatted": fmt_min(total_min),
+        "narrative": narrative,
+        "confidence": confidence,
+        "confidence_pct": confidence_pct,
+        "ctl": ctl,
+        "atl": atl,
+        "tsb": tsb,
+        "race_type": race_type,
+        "race_label": race_label,
+        "days_to_race": days_to_race,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
