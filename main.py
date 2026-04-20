@@ -1,5 +1,6 @@
 import os
 import io
+import asyncio
 import httpx
 import matplotlib
 matplotlib.use("Agg")
@@ -764,3 +765,393 @@ REGLAS:
         }
     except Exception as e:
         return {"error": str(e)}
+
+
+# ─── WEEKLY AI SUMMARY ────────────────────────────────────────────────────────
+
+@app.post("/app/ai/weekly-summary/{user_id}")
+async def app_ai_weekly_summary(user_id: str, request: Request):
+    """Monday morning narrative brief from Claude — full season context."""
+    if not SUPABASE_URL:
+        return {"error": "Supabase not configured"}
+
+    body = await request.json()
+    ctl = body.get("ctl", 0)
+    atl = body.get("atl", 0)
+    tsb = body.get("tsb", 0)
+    race_type = body.get("race_type", "full_ironman")
+    days_to_race = body.get("days_to_race", 0)
+    swim_km = body.get("swim_km", 0)
+    bike_km = body.get("bike_km", 0)
+    run_km = body.get("run_km", 0)
+    hours = body.get("hours", 0)
+    sessions_done = body.get("sessions_done", 0)
+    sessions_total = body.get("sessions_total", 0)
+
+    # Fetch last 4 weeks of completed sessions
+    completed_sessions_block = ""
+    try:
+        four_weeks_ago = (datetime.now(timezone.utc) - timedelta(days=28)).strftime('%Y-%m-%d')
+        today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/training_sessions"
+                f"?user_id=eq.{user_id}&date=gte.{four_weeks_ago}&date=lte.{today_str}"
+                f"&completed=eq.true&order=date.desc&limit=30"
+                f"&select=date,discipline,title,duration_min,distance_km,tss,rpe",
+                headers=SB_HEADERS,
+            )
+            if r.status_code == 200 and isinstance(r.json(), list):
+                for s in r.json():
+                    line = f"  {s['date']} | {s['discipline']} | {s['title']} | {s['duration_min']}min"
+                    if s.get('distance_km'):
+                        line += f" | {s['distance_km']}km"
+                    if s.get('tss'):
+                        line += f" | TSS {s['tss']}"
+                    if s.get('rpe'):
+                        line += f" | RPE {s['rpe']}"
+                    completed_sessions_block += line + "\n"
+    except Exception:
+        pass
+
+    race_names = {
+        "sprint": "Sprint", "olympic": "Triatlón Olímpico",
+        "half_ironman": "Ironman 70.3", "full_ironman": "Ironman Full"
+    }
+    race_label = race_names.get(race_type, race_type)
+
+    prompt = f"""Eres el entrenador de triatlón de élite de este atleta. Hoy es lunes y toca el resumen semanal.
+Genera un resumen motivador, concreto y personalizado. Devuelve SOLO JSON válido, sin texto fuera.
+
+ESTADO DEL ATLETA:
+- Objetivo: {race_label} en {days_to_race} días
+- CTL (fitness crónica): {ctl} TSS/día
+- ATL (fatiga aguda): {atl} TSS/día
+- TSB (forma): {tsb} → >10=fresco / 0-10=en forma / -10-0=algo cansado / <-10=muy cargado
+- Semana pasada: Natación {swim_km}km · Bici {bike_km}km · Carrera {run_km}km · {hours}h total
+- Sesiones: {sessions_done}/{sessions_total} completadas
+
+SESIONES COMPLETADAS ÚLTIMAS 4 SEMANAS:
+{completed_sessions_block or "  (sin datos)"}
+
+RESPONDE EXACTAMENTE CON ESTE JSON:
+{{
+  "title": "Título corto motivador (max 8 palabras)",
+  "headline": "Una frase impactante sobre su semana (max 20 palabras)",
+  "paragraphs": [
+    "Párrafo 1: análisis de la semana pasada (2-3 frases, con datos concretos)",
+    "Párrafo 2: estado de forma y carga (CTL/ATL/TSB explicado de forma humana)",
+    "Párrafo 3: foco y objetivo para esta semana (concreto y motivador)"
+  ],
+  "highlights": [
+    {{"icon": "trending-up", "color": "#30D158", "text": "logro o punto positivo 1"}},
+    {{"icon": "flame", "color": "#FF9F0A", "text": "logro o punto positivo 2"}},
+    {{"icon": "flag", "color": "#0A84FF", "text": "objetivo clave esta semana"}}
+  ],
+  "phase": "Base|Construcción|Pico|Taper",
+  "readiness_score": 0-100
+}}
+
+REGLAS:
+- Habla siempre en español, segunda persona (tú/tu)
+- Tono: coach cercano, directo, motivador — no genérico
+- Si el atleta no entrenó mucho, no seas duro; si entrenó bien, celebra
+- readiness_score: 100=perfecto, 70-80=bien, 50-70=aceptable, <50=recuperar"""
+
+    try:
+        import anthropic as _anthropic, json as _json
+        ai_client = _anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        message = ai_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = message.content[0].text.strip()
+        if "```" in raw:
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        result = _json.loads(raw)
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ─── GYM LOGS ANALYSIS ────────────────────────────────────────────────────────
+
+@app.get("/app/ai/gym-analysis/{user_id}")
+async def app_gym_analysis(user_id: str):
+    """Return AI insights on the user's gym progression per exercise."""
+    if not SUPABASE_URL:
+        return {"error": "Supabase not configured"}
+
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/gym_logs"
+                f"?user_id=eq.{user_id}&order=date.asc&limit=200"
+                f"&select=date,exercise_name,sets",
+                headers=SB_HEADERS,
+            )
+            logs = r.json() if r.status_code == 200 and isinstance(r.json(), list) else []
+    except Exception:
+        return {"exercises": []}
+
+    if not logs:
+        return {"exercises": []}
+
+    # Group by exercise
+    by_exercise: dict = {}
+    for log in logs:
+        name = log["exercise_name"]
+        if name not in by_exercise:
+            by_exercise[name] = []
+        by_exercise[name].append(log)
+
+    results = []
+    for name, exercise_logs in by_exercise.items():
+        if len(exercise_logs) < 2:
+            continue
+        # Extract max weight per session
+        sessions = []
+        for log in exercise_logs[-6:]:
+            sets = log.get("sets", [])
+            if isinstance(sets, list) and sets:
+                max_w = max((s.get("weight_kg", 0) for s in sets), default=0)
+                total_vol = sum(s.get("reps", 0) * s.get("weight_kg", 0) for s in sets)
+                sessions.append({"date": log["date"], "max_w": max_w, "volume": total_vol})
+        if len(sessions) < 2:
+            continue
+        last = sessions[-1]
+        prev = sessions[-2]
+        # Simple rule-based insight (same as frontend, duplicated for backend use)
+        if last["max_w"] > prev["max_w"]:
+            insight = f"+{round(last['max_w'] - prev['max_w'], 1)} kg respecto a la sesión anterior"
+            insight_type = "progress"
+        elif last["volume"] > prev["volume"] * 1.05:
+            insight = f"Más volumen total (+{round(last['volume'] - prev['volume'])} kg·rep)"
+            insight_type = "progress"
+        else:
+            insight = f"Mantén {last['max_w']} kg, intenta añadir 1 rep más por serie"
+            insight_type = "info"
+
+        results.append({
+            "exercise": name,
+            "sessions": len(exercise_logs),
+            "last_max_weight": last["max_w"],
+            "insight": insight,
+            "insight_type": insight_type,
+        })
+
+    return {"exercises": results}
+
+
+# ─── AI COACH CONVERSACIONAL ──────────────────────────────────────────────────
+
+COACH_SYSTEM_PROMPT = """Eres el AI Coach de TriRace, el entrenador personal de triatlón de élite del atleta.
+Eres experto en fisiología del deporte, periodización del entrenamiento, nutrición para resistencia y preparación mental para Ironman.
+
+CARÁCTER:
+- Directo, motivador y honesto. Nunca condescendiente.
+- Usas los datos reales del atleta en cada respuesta (números, fechas, tiempos).
+- Respuestas cortas y accionables, a menos que se pida análisis profundo.
+- Hablas en español, segunda persona singular (tú/tu).
+- Puedes usar emojis con moderación para dar energía.
+- Cuando hay señales de sobreentrenamiento (TSB < -15), lo mencionas proactivamente.
+- Adaptas el consejo al wellness del día (si tiene dolor muscular o poca energía, no mandas sesión dura).
+- Sabes que el atleta usa TriRace para prepararse para su objetivo de carrera.
+
+DATOS ACTUALES DEL ATLETA:
+{context}
+
+REGLAS:
+- Mantén el hilo de la conversación. Recuerda lo que se ha hablado.
+- Si el atleta pregunta si puede cambiar una sesión, evalúa el TSB y el wellness antes de responder.
+- Si faltan menos de 21 días para la carrera (taper), recuérdalo cuando sea relevante.
+- Respuestas de 1-4 párrafos cortos. Nunca hagas listas largas sin que se pidan.
+- Si no sabes algo con certeza, dilo claramente."""
+
+
+async def fetch_coach_context(user_id: str) -> str:
+    """Fetch all athlete data from Supabase and return a formatted context block."""
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    three_days_ago = (datetime.now(timezone.utc) - timedelta(days=3)).strftime('%Y-%m-%d')
+
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        profile_r, wellness_r, sessions_r, activities_r = await asyncio.gather(
+            client.get(f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=name,race_type,race_date,ftp,swim_css,run_threshold_pace,max_hr,weight_kg,level", headers=SB_HEADERS),
+            client.get(f"{SUPABASE_URL}/rest/v1/wellness_logs?user_id=eq.{user_id}&date=eq.{today}&select=*", headers=SB_HEADERS),
+            client.get(f"{SUPABASE_URL}/rest/v1/training_sessions?user_id=eq.{user_id}&date=eq.{today}&select=discipline,title,duration_min,distance_km,tss,completed", headers=SB_HEADERS),
+            client.get(f"{SUPABASE_URL}/rest/v1/activities?user_id=eq.{user_id}&date=gte.{three_days_ago}&order=date.desc&limit=3&select=discipline,title,date,duration_min,distance_km,avg_hr,tss", headers=SB_HEADERS),
+        )
+
+    profile = (profile_r.json() or [{}])[0]
+    wellness = (wellness_r.json() or [None])[0]
+    sessions_today = sessions_r.json() or []
+    recent_activities = activities_r.json() or []
+
+    # Compute days to race
+    days_to_race = "?"
+    if profile.get("race_date"):
+        try:
+            rd = datetime.strptime(profile["race_date"], "%Y-%m-%d")
+            days_to_race = max(0, (rd - datetime.now()).days)
+        except Exception:
+            pass
+
+    race_names = {"sprint": "Sprint", "olympic": "Triatlón Olímpico", "half_ironman": "Ironman 70.3", "full_ironman": "Ironman Full"}
+    race_label = race_names.get(profile.get("race_type", ""), "Ironman")
+
+    lines = [
+        f"Nombre: {profile.get('name', 'atleta')}",
+        f"Objetivo: {race_label} el {profile.get('race_date', '?')} ({days_to_race} días)",
+        f"Nivel: {profile.get('level', '?')}",
+        f"Umbrales: FTP {profile.get('ftp', '?')}W · CSS {profile.get('swim_css', '?')}s/100m · Umbral carrera {profile.get('run_threshold_pace', '?')}s/km · FC máx {profile.get('max_hr', '?')} bpm",
+        f"Peso: {profile.get('weight_kg', '?')} kg",
+    ]
+
+    if wellness:
+        w_parts = []
+        if wellness.get("hrv"):         w_parts.append(f"HRV {wellness['hrv']} ms")
+        if wellness.get("sleep_hours"): w_parts.append(f"Sueño {wellness['sleep_hours']}h")
+        if wellness.get("sleep_quality"):  w_parts.append(f"Calidad sueño {wellness['sleep_quality']}/5")
+        if wellness.get("energy_level"):   w_parts.append(f"Energía {wellness['energy_level']}/5")
+        if wellness.get("muscle_soreness"):w_parts.append(f"Dolor muscular {wellness['muscle_soreness']}/5")
+        if wellness.get("mood"):           w_parts.append(f"Ánimo {wellness['mood']}/5")
+        lines.append("Wellness hoy: " + " · ".join(w_parts) if w_parts else "Wellness hoy: no registrado")
+    else:
+        lines.append("Wellness hoy: no registrado")
+
+    if sessions_today:
+        for s in sessions_today:
+            status = "✅ completada" if s.get("completed") else "⏳ pendiente"
+            line = f"Sesión hoy ({status}): {s['discipline']} — {s['title']} {s['duration_min']}min"
+            if s.get("distance_km"): line += f" {s['distance_km']}km"
+            if s.get("tss"):         line += f" TSS {s['tss']}"
+            lines.append(line)
+    else:
+        lines.append("Sesión hoy: día de descanso o sin plan")
+
+    if recent_activities:
+        lines.append("Últimas actividades:")
+        for a in recent_activities:
+            line = f"  {a['date']} {a['discipline']} — {a['title']} {a['duration_min']}min"
+            if a.get("distance_km"): line += f" {a['distance_km']}km"
+            if a.get("avg_hr"):      line += f" FC {a['avg_hr']}bpm"
+            if a.get("tss"):         line += f" TSS {a['tss']}"
+            lines.append(line)
+
+    return "\n".join(lines)
+
+
+@app.post("/app/ai/coach/chat/{user_id}")
+async def app_coach_chat(user_id: str, request: Request):
+    if not SUPABASE_URL:
+        return {"error": "Supabase not configured"}
+
+    import anthropic as _anthropic, json as _json
+
+    body = await request.json()
+    user_message = body.get("message", "").strip()
+    conversation_id = body.get("conversation_id")
+    ctl = body.get("ctl", 0)
+    atl = body.get("atl", 0)
+    tsb = body.get("tsb", 0)
+
+    if not user_message:
+        return {"error": "message is required"}
+
+    # ── Load or create conversation ───────────────────────────────────────────
+    existing_messages = []
+    if conversation_id:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/coach_conversations?id=eq.{conversation_id}&user_id=eq.{user_id}&select=id,messages",
+                headers=SB_HEADERS,
+            )
+            rows = r.json() if r.status_code == 200 else []
+            if rows:
+                existing_messages = rows[0].get("messages", [])
+    else:
+        # Try to load latest conversation for this user
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/coach_conversations?user_id=eq.{user_id}&order=updated_at.desc&limit=1&select=id,messages",
+                headers=SB_HEADERS,
+            )
+            rows = r.json() if r.status_code == 200 else []
+            if rows:
+                conversation_id = rows[0]["id"]
+                existing_messages = rows[0].get("messages", [])
+
+    # ── Build context ─────────────────────────────────────────────────────────
+    try:
+        athlete_context = await fetch_coach_context(user_id)
+    except Exception as e:
+        athlete_context = f"(Error cargando datos: {e})"
+
+    tsb_label = "fresco" if tsb > 10 else "en forma" if tsb >= 0 else "algo cansado" if tsb >= -10 else "muy cargado"
+    athlete_context += f"\nForma física: CTL {ctl} · ATL {atl} · TSB {tsb} ({tsb_label})"
+
+    system_prompt = COACH_SYSTEM_PROMPT.format(context=athlete_context)
+
+    # ── Call Claude ───────────────────────────────────────────────────────────
+    ai_messages = []
+    # Include last 20 turns of history to keep context manageable
+    for msg in existing_messages[-20:]:
+        if msg.get("role") in ("user", "assistant") and msg.get("content"):
+            ai_messages.append({"role": msg["role"], "content": msg["content"]})
+
+    ai_messages.append({"role": "user", "content": user_message})
+
+    try:
+        ai_client = _anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        response = ai_client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1024,
+            system=system_prompt,
+            messages=ai_messages,
+        )
+        reply = response.content[0].text.strip()
+    except Exception as e:
+        return {"error": f"AI error: {e}"}
+
+    # ── Save conversation ─────────────────────────────────────────────────────
+    from datetime import datetime as _dt
+    now_iso = _dt.now(timezone.utc).isoformat()
+    updated_messages = existing_messages + [
+        {"role": "user",      "content": user_message, "timestamp": now_iso},
+        {"role": "assistant", "content": reply,        "timestamp": now_iso},
+    ]
+
+    async with httpx.AsyncClient() as client:
+        if conversation_id:
+            await client.patch(
+                f"{SUPABASE_URL}/rest/v1/coach_conversations?id=eq.{conversation_id}&user_id=eq.{user_id}",
+                json={"messages": updated_messages},
+                headers={**SB_HEADERS, "Prefer": "return=minimal"},
+            )
+        else:
+            r = await client.post(
+                f"{SUPABASE_URL}/rest/v1/coach_conversations",
+                json={"user_id": user_id, "messages": updated_messages},
+                headers={**SB_HEADERS, "Prefer": "return=representation"},
+            )
+            created = r.json()
+            if isinstance(created, list) and created:
+                conversation_id = created[0]["id"]
+
+    return {"reply": reply, "conversation_id": conversation_id}
+
+
+@app.delete("/app/ai/coach/conversation/{user_id}")
+async def clear_coach_conversation(user_id: str):
+    """Delete all conversations for a user so the next chat starts fresh."""
+    if not SUPABASE_URL:
+        return {"error": "not configured"}
+    async with httpx.AsyncClient() as client:
+        await client.delete(
+            f"{SUPABASE_URL}/rest/v1/coach_conversations?user_id=eq.{user_id}",
+            headers=SB_HEADERS,
+        )
+    return {"ok": True}
