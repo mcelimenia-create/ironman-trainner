@@ -1159,6 +1159,112 @@ async def clear_coach_conversation(user_id: str):
 
 # ─── RACE SIMULATOR ───────────────────────────────────────────────────────────
 
+# ─── GAMIFICATION ─────────────────────────────────────────────────────────────
+
+XP_EVENTS = {
+    "session_complete": 50,
+    "session_full":     25,   # bonus when completion == 'full'
+    "pr":              100,
+    "wellness":         15,
+    "streak":           10,
+}
+
+LEVELS = [
+    {"level": 1, "name": "Rookie",    "emoji": "🥉", "min_xp": 0,    "max_xp": 299  },
+    {"level": 2, "name": "Finisher",  "emoji": "🥈", "min_xp": 300,  "max_xp": 799  },
+    {"level": 3, "name": "Triatleta", "emoji": "🥇", "min_xp": 800,  "max_xp": 1999 },
+    {"level": 4, "name": "Ironman",   "emoji": "⭐", "min_xp": 2000, "max_xp": 4999 },
+    {"level": 5, "name": "Legend",    "emoji": "👑", "min_xp": 5000, "max_xp": None  },
+]
+
+def get_level(xp: int) -> dict:
+    for l in reversed(LEVELS):
+        if xp >= l["min_xp"]:
+            return l
+    return LEVELS[0]
+
+
+@app.post("/app/gamification/award/{user_id}")
+async def award_gamification(user_id: str, request: Request):
+    if not SUPABASE_URL:
+        return {"error": "Supabase not configured"}
+
+    body = await request.json()
+    event = body.get("event", "")
+    metadata = body.get("metadata") or {}
+
+    xp_earned = XP_EVENTS.get(event, 0)
+    if event == "session_complete" and metadata.get("completion") == "full":
+        xp_earned += XP_EVENTS["session_full"]
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Load current gamification row
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/user_gamification?user_id=eq.{user_id}&select=*",
+            headers=SB_HEADERS,
+        )
+        rows = r.json() if r.status_code == 200 and isinstance(r.json(), list) else []
+
+    current = rows[0] if rows else {
+        "user_id": user_id, "xp_total": 0, "level": 1,
+        "streak_days": 0, "last_activity_date": None, "prs": {}, "badges": [],
+    }
+
+    old_xp = current.get("xp_total", 0)
+    old_level_info = get_level(old_xp)
+
+    # Streak logic (only for session events)
+    streak = current.get("streak_days", 0)
+    last_date = current.get("last_activity_date")
+    if event in ("session_complete",):
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+        if last_date == today:
+            pass  # already trained today, no streak change
+        elif last_date == yesterday:
+            streak += 1
+            xp_earned += XP_EVENTS["streak"]  # streak bonus
+        else:
+            streak = 1  # reset
+        last_date = today
+
+    new_xp = old_xp + xp_earned
+    new_level_info = get_level(new_xp)
+    level_up = new_level_info["level"] > old_level_info["level"]
+
+    payload = {
+        "user_id": user_id,
+        "xp_total": new_xp,
+        "level": new_level_info["level"],
+        "streak_days": streak,
+        "last_activity_date": last_date,
+    }
+
+    async with httpx.AsyncClient() as client:
+        if rows:
+            await client.patch(
+                f"{SUPABASE_URL}/rest/v1/user_gamification?user_id=eq.{user_id}",
+                json=payload,
+                headers={**SB_HEADERS, "Prefer": "return=minimal"},
+            )
+        else:
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/user_gamification",
+                json={**payload, "prs": {}, "badges": []},
+                headers={**SB_HEADERS, "Prefer": "return=minimal"},
+            )
+
+    return {
+        "xp_earned": xp_earned,
+        "new_total": new_xp,
+        "level_up": level_up,
+        "new_level": new_level_info["name"],
+        "new_level_emoji": new_level_info["emoji"],
+        "streak_days": streak,
+    }
+
+
 @app.get("/app/race/predict/{user_id}")
 async def app_race_predict(user_id: str):
     """Compute per-segment race prediction + Claude narrative from athlete data."""
