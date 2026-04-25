@@ -1237,6 +1237,8 @@ async def award_gamification(user_id: str, request: Request):
         "user_id": user_id,
         "xp_total": new_xp,
         "level": new_level_info["level"],
+        "level_name": new_level_info["name"],
+        "level_emoji": new_level_info["emoji"],
         "streak_days": streak,
         "last_activity_date": last_date,
     }
@@ -1859,3 +1861,29 @@ async def rival_active(user_id: str):
             "is_challenger":   challenger_id == user_id,
         }
     }
+
+
+# ── Race modalities ───────────────────────────────────────────────────────────
+
+@app.get("/app/race-modalities")
+async def get_race_modalities():
+    if not SUPABASE_URL:
+        return []
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/race_modalities?select=*&order=category,id",
+            headers=SB_HEADERS,
+        )
+    return r.json() if r.status_code == 200 and isinstance(r.json(), list) else []
+
+
+@app.get("/app/race-modalities/{category}")
+async def get_race_modalities_by_category(category: str):
+    if not SUPABASE_URL:
+        return []
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/race_modalities?category=eq.{category}&select=*&order=id",
+            headers=SB_HEADERS,
+        )
+    return r.json() if r.status_code == 200 and isinstance(r.json(), list) else []
