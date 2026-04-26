@@ -2620,3 +2620,148 @@ async def sync_device(device_id: str):
             json={"last_sync": now_iso},
         )
     return {"success": r.status_code in (200, 204), "last_sync": now_iso}
+
+
+# ─── Progress ─────────────────────────────────────────────────────────────────
+
+@app.get("/app/progress/ctl-atl-tsb/{user_id}")
+async def get_progress_fitness(user_id: str, days: int = 90):
+    from datetime import date as _date, timedelta as _td
+    from collections import defaultdict
+    import math
+    if not SUPABASE_URL:
+        return {"history": []}
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/activities?user_id=eq.{user_id}&select=date,tss,duration_min&order=date.asc&limit=500",
+            headers=SB_HEADERS,
+        )
+    acts = r.json() if r.status_code == 200 else []
+
+    daily_tss: dict = defaultdict(float)
+    for a in acts:
+        raw_date = str(a.get("date", ""))[:10]
+        tss = a.get("tss") or round((a.get("duration_min") or 0) * 0.8)
+        if raw_date:
+            daily_tss[raw_date] += tss
+
+    K_CTL = 1 - math.exp(-1 / 42)
+    K_ATL = 1 - math.exp(-1 / 7)
+    ctl, atl = 0.0, 0.0
+
+    today = _date.today()
+    window_start = today - _td(days=days - 1)
+
+    # Warm up CTL/ATL on data before the window
+    all_sorted = sorted(daily_tss.keys())
+    if all_sorted:
+        d = _date.fromisoformat(all_sorted[0])
+        while d < window_start:
+            tss = daily_tss.get(d.isoformat(), 0)
+            ctl = ctl + K_CTL * (tss - ctl)
+            atl = atl + K_ATL * (tss - atl)
+            d += _td(days=1)
+
+    history = []
+    d = window_start
+    while d <= today:
+        tss = daily_tss.get(d.isoformat(), 0)
+        ctl = ctl + K_CTL * (tss - ctl)
+        atl = atl + K_ATL * (tss - atl)
+        history.append({
+            "date": d.isoformat(),
+            "ctl": round(ctl, 1),
+            "atl": round(atl, 1),
+            "tsb": round(ctl - atl, 1),
+            "tss": round(tss, 1),
+        })
+        d += _td(days=1)
+
+    return {"history": history}
+
+
+@app.get("/app/progress/activities-summary/{user_id}")
+async def get_activities_summary(user_id: str):
+    from collections import defaultdict
+    if not SUPABASE_URL:
+        return {"summary": [], "totals": {}}
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/activities?user_id=eq.{user_id}&select=discipline,distance_km,duration_min,tss&limit=500",
+            headers=SB_HEADERS,
+        )
+    acts = r.json() if r.status_code == 200 else []
+
+    by_disc: dict = defaultdict(lambda: {"count": 0, "total_km": 0.0, "total_min": 0, "total_tss": 0})
+    for a in acts:
+        disc = a.get("discipline") or "other"
+        by_disc[disc]["count"] += 1
+        by_disc[disc]["total_km"] += a.get("distance_km") or 0
+        by_disc[disc]["total_min"] += a.get("duration_min") or 0
+        by_disc[disc]["total_tss"] += a.get("tss") or 0
+
+    summary = [
+        {
+            "discipline": disc,
+            "count": v["count"],
+            "total_km": round(v["total_km"], 1),
+            "total_hours": round(v["total_min"] / 60, 1),
+            "total_tss": round(v["total_tss"]),
+        }
+        for disc, v in sorted(by_disc.items(), key=lambda x: -x[1]["total_min"])
+    ]
+    return {
+        "summary": summary,
+        "totals": {
+            "activities": len(acts),
+            "total_hours": round(sum(a.get("duration_min") or 0 for a in acts) / 60, 1),
+            "total_km": round(sum(a.get("distance_km") or 0 for a in acts), 1),
+            "total_tss": round(sum(a.get("tss") or 0 for a in acts)),
+        },
+    }
+
+
+@app.get("/app/progress/prs/{user_id}")
+async def get_personal_records(user_id: str):
+    if not SUPABASE_URL:
+        return {"prs": []}
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/activities?user_id=eq.{user_id}&select=discipline,distance_km,duration_min,date&limit=500",
+            headers=SB_HEADERS,
+        )
+    acts = r.json() if r.status_code == 200 else []
+
+    best_dist: dict = {}
+    best_pace: dict = {}
+    for a in acts:
+        disc = a.get("discipline") or "other"
+        km = a.get("distance_km") or 0
+        dur = a.get("duration_min") or 0
+        if km <= 0 or dur <= 0:
+            continue
+        if disc not in best_dist or km > best_dist[disc]["km"]:
+            best_dist[disc] = {"km": km, "dur": dur, "date": a.get("date", "")}
+        pace = dur / km
+        if disc not in best_pace or pace < best_pace[disc]["pace"]:
+            best_pace[disc] = {"pace": pace, "km": km, "dur": dur, "date": a.get("date", "")}
+
+    prs = []
+    for disc, b in best_dist.items():
+        pr: dict = {
+            "discipline": disc,
+            "best_km": round(b["km"], 2),
+            "best_duration_min": b["dur"],
+            "best_date": b["date"],
+        }
+        if disc in best_pace:
+            f = best_pace[disc]
+            total_sec = f["pace"] * 60
+            pm, ps = int(total_sec // 60), int(total_sec % 60)
+            pr["fastest_pace"] = f"{pm}:{str(ps).zfill(2)} /km"
+            pr["fastest_pace_km"] = round(f["km"], 2)
+            pr["fastest_pace_date"] = f["date"]
+        prs.append(pr)
+
+    order = {"swim": 0, "bike": 1, "run": 2, "gym": 3, "brick": 4}
+    return {"prs": sorted(prs, key=lambda x: order.get(x["discipline"], 5))}
