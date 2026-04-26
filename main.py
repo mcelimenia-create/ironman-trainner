@@ -2138,3 +2138,485 @@ async def update_activity(activity_id: str, request: Request):
             json=updates,
         )
     return {"success": r.status_code in (200, 204)}
+
+
+# ─── FRIENDS & CHAT ───────────────────────────────────────────────────────────
+
+@app.post("/app/social/friends/add")
+async def add_friend(request: Request):
+    body = await request.json()
+    from_id = body.get("from_user_id")
+    to_id = body.get("to_user_id")
+    if not from_id or not to_id or not SUPABASE_URL:
+        return {"success": False, "error": "missing fields"}
+    if from_id == to_id:
+        return {"success": False, "error": "cannot add yourself"}
+
+    # Canonical order: smaller UUID first
+    a, b = (from_id, to_id) if from_id < to_id else (to_id, from_id)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    async with httpx.AsyncClient() as client:
+        # Check existing
+        chk = await client.get(
+            f"{SUPABASE_URL}/rest/v1/friendships?user_a=eq.{a}&user_b=eq.{b}&select=id,status",
+            headers=SB_HEADERS,
+        )
+        existing = chk.json() if chk.status_code == 200 and isinstance(chk.json(), list) else []
+        if existing:
+            return {"success": False, "error": "already_exists", "status": existing[0].get("status")}
+
+        r = await client.post(
+            f"{SUPABASE_URL}/rest/v1/friendships",
+            headers={**SB_HEADERS, "Prefer": "return=representation"},
+            json={"user_a": a, "user_b": b, "status": "pending",
+                  "requester_id": from_id, "created_at": now_iso, "updated_at": now_iso},
+        )
+    if r.status_code in (200, 201):
+        rows = r.json() if isinstance(r.json(), list) else []
+        return {"success": True, "friendship": rows[0] if rows else None}
+    return {"success": False, "error": r.text}
+
+
+@app.post("/app/social/friends/accept/{friendship_id}")
+async def accept_friend(friendship_id: str, request: Request):
+    body = await request.json()
+    user_id = body.get("user_id")
+    if not user_id or not SUPABASE_URL:
+        return {"success": False, "error": "missing user_id"}
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    async with httpx.AsyncClient() as client:
+        # Verify user is part of this friendship
+        chk = await client.get(
+            f"{SUPABASE_URL}/rest/v1/friendships?id=eq.{friendship_id}"
+            f"&or=(user_a.eq.{user_id},user_b.eq.{user_id})&select=id",
+            headers=SB_HEADERS,
+        )
+        rows = chk.json() if chk.status_code == 200 and isinstance(chk.json(), list) else []
+        if not rows:
+            return {"success": False, "error": "not found"}
+
+        r = await client.patch(
+            f"{SUPABASE_URL}/rest/v1/friendships?id=eq.{friendship_id}",
+            headers=SB_HEADERS,
+            json={"status": "accepted", "updated_at": now_iso},
+        )
+    return {"success": r.status_code in (200, 204)}
+
+
+@app.get("/app/social/friends/{user_id}")
+async def get_friends(user_id: str):
+    if not SUPABASE_URL:
+        return []
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/friendships"
+            f"?or=(user_a.eq.{user_id},user_b.eq.{user_id})&status=eq.accepted&select=*",
+            headers=SB_HEADERS,
+        )
+    return r.json() if r.status_code == 200 and isinstance(r.json(), list) else []
+
+
+@app.get("/app/social/friends/pending/{user_id}")
+async def get_pending_friends(user_id: str):
+    if not SUPABASE_URL:
+        return []
+    async with httpx.AsyncClient() as client:
+        # Requests TO this user (requester_id != user_id means someone else sent it)
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/friendships"
+            f"?or=(user_a.eq.{user_id},user_b.eq.{user_id})"
+            f"&status=eq.pending&select=*",
+            headers=SB_HEADERS,
+        )
+    rows = r.json() if r.status_code == 200 and isinstance(r.json(), list) else []
+    # Only return requests where current user is not the requester
+    return [f for f in rows if f.get("requester_id") != user_id]
+
+
+@app.post("/app/social/chat/direct")
+async def create_direct_chat(request: Request):
+    body = await request.json()
+    user_a = body.get("user_id")
+    user_b = body.get("other_user_id")
+    if not user_a or not user_b or not SUPABASE_URL:
+        return {"success": False, "error": "missing fields"}
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    async with httpx.AsyncClient() as client:
+        # Find existing direct room shared by both users
+        ra = await client.get(
+            f"{SUPABASE_URL}/rest/v1/chat_room_members?user_id=eq.{user_a}&select=room_id",
+            headers=SB_HEADERS,
+        )
+        rb = await client.get(
+            f"{SUPABASE_URL}/rest/v1/chat_room_members?user_id=eq.{user_b}&select=room_id",
+            headers=SB_HEADERS,
+        )
+        rooms_a = {m["room_id"] for m in (ra.json() or []) if isinstance(ra.json(), list)}
+        rooms_b = {m["room_id"] for m in (rb.json() or []) if isinstance(rb.json(), list)}
+        shared = rooms_a & rooms_b
+
+        if shared:
+            for room_id in shared:
+                rr = await client.get(
+                    f"{SUPABASE_URL}/rest/v1/chat_rooms?id=eq.{room_id}&type=eq.direct&select=*",
+                    headers=SB_HEADERS,
+                )
+                existing = rr.json() if isinstance(rr.json(), list) else []
+                if existing:
+                    return {"success": True, "room": existing[0], "created": False}
+
+        # Create new room
+        r = await client.post(
+            f"{SUPABASE_URL}/rest/v1/chat_rooms",
+            headers={**SB_HEADERS, "Prefer": "return=representation"},
+            json={"type": "direct", "created_by": user_a,
+                  "created_at": now_iso, "updated_at": now_iso},
+        )
+        rooms = r.json() if isinstance(r.json(), list) else []
+        if not rooms:
+            return {"success": False, "error": "could not create room"}
+        new_room = rooms[0]
+        room_id = new_room["id"]
+
+        # Add both members
+        await client.post(
+            f"{SUPABASE_URL}/rest/v1/chat_room_members",
+            headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates"},
+            json={"room_id": room_id, "user_id": user_a, "role": "member", "joined_at": now_iso},
+        )
+        await client.post(
+            f"{SUPABASE_URL}/rest/v1/chat_room_members",
+            headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates"},
+            json={"room_id": room_id, "user_id": user_b, "role": "member", "joined_at": now_iso},
+        )
+    return {"success": True, "room": new_room, "created": True}
+
+
+@app.post("/app/social/chat/groups/create")
+async def create_group_chat(request: Request):
+    body = await request.json()
+    creator_id = body.get("user_id")
+    name = body.get("name", "").strip()
+    members: list = body.get("members", [])
+    description = body.get("description", "")
+    if not creator_id or not name or not SUPABASE_URL:
+        return {"success": False, "error": "missing fields"}
+    if len(members) < 1:
+        return {"success": False, "error": "need at least 1 other member"}
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"{SUPABASE_URL}/rest/v1/chat_rooms",
+            headers={**SB_HEADERS, "Prefer": "return=representation"},
+            json={"type": "group", "name": name, "description": description,
+                  "created_by": creator_id, "created_at": now_iso, "updated_at": now_iso},
+        )
+        rooms = r.json() if isinstance(r.json(), list) else []
+        if not rooms:
+            return {"success": False, "error": "could not create group"}
+        room_id = rooms[0]["id"]
+
+        all_members = list({creator_id} | set(members))
+        for uid in all_members:
+            role = "admin" if uid == creator_id else "member"
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/chat_room_members",
+                headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates"},
+                json={"room_id": room_id, "user_id": uid, "role": role, "joined_at": now_iso},
+            )
+    return {"success": True, "room": rooms[0]}
+
+
+@app.post("/app/social/chat/groups/{group_id}/leave")
+async def leave_group(group_id: str, request: Request):
+    body = await request.json()
+    user_id = body.get("user_id")
+    if not user_id or not SUPABASE_URL:
+        return {"success": False, "error": "missing user_id"}
+    async with httpx.AsyncClient() as client:
+        r = await client.delete(
+            f"{SUPABASE_URL}/rest/v1/chat_room_members?room_id=eq.{group_id}&user_id=eq.{user_id}",
+            headers=SB_HEADERS,
+        )
+    return {"success": r.status_code in (200, 204)}
+
+
+# ─── Race Catalog ─────────────────────────────────────────────────────────────
+
+@app.get("/app/race-catalog")
+async def get_race_catalog(
+    modality: str = None,
+    date_from: str = None,
+    date_to: str = None,
+    region: str = None,
+    search: str = None,
+):
+    if not SUPABASE_URL:
+        return {"races": []}
+    params = "select=*&order=race_date.asc"
+    if modality:
+        params += f"&modality=eq.{modality}"
+    if date_from:
+        params += f"&race_date=gte.{date_from}"
+    if date_to:
+        params += f"&race_date=lte.{date_to}"
+    if region:
+        params += f"&region=ilike.*{region}*"
+    if search:
+        params += f"&name=ilike.*{search}*"
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/races?{params}",
+            headers=SB_HEADERS,
+        )
+    if r.status_code != 200:
+        return {"races": []}
+    return {"races": r.json()}
+
+
+@app.get("/app/race-catalog/{race_id}")
+async def get_race_detail(race_id: str):
+    if not SUPABASE_URL:
+        return {"race": None, "athletes": []}
+    async with httpx.AsyncClient() as client:
+        race_r, reg_r = await asyncio.gather(
+            client.get(
+                f"{SUPABASE_URL}/rest/v1/races?id=eq.{race_id}&select=*",
+                headers=SB_HEADERS,
+            ),
+            client.get(
+                f"{SUPABASE_URL}/rest/v1/race_registrations?race_id=eq.{race_id}&select=user_id,goal_time,profiles(name,xp,level)",
+                headers=SB_HEADERS,
+            ),
+        )
+    races = race_r.json() if race_r.status_code == 200 else []
+    regs = reg_r.json() if reg_r.status_code == 200 else []
+    athletes = [
+        {
+            "user_id": reg.get("user_id"),
+            "name": (reg.get("profiles") or {}).get("name", "Atleta"),
+            "xp": (reg.get("profiles") or {}).get("xp", 0),
+            "level": (reg.get("profiles") or {}).get("level", "beginner"),
+            "goal_time": reg.get("goal_time"),
+        }
+        for reg in regs
+    ]
+    return {"race": races[0] if races else None, "athletes": athletes}
+
+
+@app.post("/app/race-catalog/{race_id}/register")
+async def register_for_race(race_id: str, request: Request):
+    body = await request.json()
+    user_id = body.get("user_id")
+    goal_time = body.get("goal_time")
+    if not user_id or not SUPABASE_URL:
+        return {"success": False, "error": "missing user_id"}
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"{SUPABASE_URL}/rest/v1/race_registrations",
+            headers={**SB_HEADERS, "Prefer": "resolution=merge-duplicates"},
+            json={"race_id": race_id, "user_id": user_id, "goal_time": goal_time},
+        )
+    return {"success": r.status_code in (200, 201)}
+
+
+# ─── Ranking ──────────────────────────────────────────────────────────────────
+
+@app.get("/app/ranking/worldwide/{modality}")
+async def get_worldwide_ranking(modality: str):
+    if not SUPABASE_URL:
+        return {"ranking": []}
+    params = "select=id,name,xp,level&order=xp.desc&limit=50"
+    if modality and modality != "all":
+        params += f"&preferred_discipline=eq.{modality}"
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/profiles?{params}",
+            headers=SB_HEADERS,
+        )
+    if r.status_code != 200:
+        return {"ranking": []}
+    profiles = r.json()
+    return {
+        "ranking": [
+            {**p, "position": i + 1}
+            for i, p in enumerate(profiles)
+        ]
+    }
+
+
+@app.get("/app/ranking/friends/{user_id}/{modality}")
+async def get_friends_ranking(user_id: str, modality: str):
+    if not SUPABASE_URL:
+        return {"ranking": []}
+    async with httpx.AsyncClient() as client:
+        fs_r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/friendships?status=eq.accepted&select=requester_id,addressee_id&or=(requester_id.eq.{user_id},addressee_id.eq.{user_id})",
+            headers=SB_HEADERS,
+        )
+    friendships = fs_r.json() if fs_r.status_code == 200 else []
+    friend_ids = set()
+    for fs in friendships:
+        fid = fs["addressee_id"] if fs["requester_id"] == user_id else fs["requester_id"]
+        friend_ids.add(fid)
+    friend_ids.add(user_id)
+
+    if not friend_ids:
+        return {"ranking": []}
+
+    id_filter = ",".join(friend_ids)
+    params = f"select=id,name,xp,level&id=in.({id_filter})&order=xp.desc"
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/profiles?{params}",
+            headers=SB_HEADERS,
+        )
+    if r.status_code != 200:
+        return {"ranking": []}
+    profiles = r.json()
+    return {
+        "ranking": [
+            {**p, "position": i + 1, "is_me": p["id"] == user_id}
+            for i, p in enumerate(profiles)
+        ]
+    }
+
+
+# ─── Profile (extended) ───────────────────────────────────────────────────────
+
+@app.get("/app/profile/{user_id}")
+async def get_public_profile(user_id: str):
+    if not SUPABASE_URL:
+        return {"profile": None}
+    async with httpx.AsyncClient() as client:
+        prof_r, gam_r, race_r, act_r = await asyncio.gather(
+            client.get(
+                f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}&select=id,name,level,race_type,race_date,ftp,max_hr,weight_kg,avatar_url,cover_url,bio,location,strava_connected",
+                headers=SB_HEADERS,
+            ),
+            client.get(
+                f"{SUPABASE_URL}/rest/v1/user_gamification?user_id=eq.{user_id}&select=xp_total,streak_days,level_name",
+                headers=SB_HEADERS,
+            ),
+            client.get(
+                f"{SUPABASE_URL}/rest/v1/race_results?user_id=eq.{user_id}&select=id&order=race_date.desc",
+                headers=SB_HEADERS,
+            ),
+            client.get(
+                f"{SUPABASE_URL}/rest/v1/activities?user_id=eq.{user_id}&select=id,tss&order=date.desc&limit=90",
+                headers=SB_HEADERS,
+            ),
+        )
+    profiles = prof_r.json() if prof_r.status_code == 200 else []
+    gam = gam_r.json()[0] if gam_r.status_code == 200 and gam_r.json() else {}
+    races = race_r.json() if race_r.status_code == 200 else []
+    acts = act_r.json() if act_r.status_code == 200 else []
+    if not profiles:
+        return {"profile": None}
+    p = profiles[0]
+    K_CTL = 1 - (1 / 42)
+    ctl = 0.0
+    for a in reversed(acts):
+        tss = a.get("tss") or 0
+        ctl = ctl * K_CTL + tss * (1 - K_CTL)
+    return {
+        "profile": {
+            **p,
+            "xp_total": gam.get("xp_total", 0),
+            "streak_days": gam.get("streak_days", 0),
+            "level_name": gam.get("level_name"),
+            "races_completed": len(races),
+            "ctl": round(ctl, 1),
+        }
+    }
+
+
+@app.put("/app/profile/{user_id}")
+async def update_profile(user_id: str, request: Request):
+    body = await request.json()
+    allowed = {"name", "avatar_url", "cover_url", "bio", "location"}
+    patch = {k: v for k, v in body.items() if k in allowed}
+    if not patch or not SUPABASE_URL:
+        return {"success": False, "error": "nothing to update"}
+    async with httpx.AsyncClient() as client:
+        r = await client.patch(
+            f"{SUPABASE_URL}/rest/v1/profiles?id=eq.{user_id}",
+            headers={**SB_HEADERS, "Prefer": "return=representation"},
+            json=patch,
+        )
+    if r.status_code in (200, 204):
+        data = r.json()
+        return {"success": True, "profile": data[0] if data else patch}
+    return {"success": False, "error": r.text}
+
+
+# ─── Devices ──────────────────────────────────────────────────────────────────
+
+@app.get("/app/devices/{user_id}")
+async def get_devices(user_id: str):
+    if not SUPABASE_URL:
+        return {"devices": []}
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/user_devices?user_id=eq.{user_id}&select=*&order=created_at.desc",
+            headers=SB_HEADERS,
+        )
+    return {"devices": r.json() if r.status_code == 200 else []}
+
+
+@app.post("/app/devices/add")
+async def add_device(request: Request):
+    body = await request.json()
+    user_id = body.get("user_id")
+    device_type = body.get("device_type")
+    if not user_id or not device_type or not SUPABASE_URL:
+        return {"success": False, "error": "missing fields"}
+    now_iso = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "user_id": user_id,
+        "device_type": device_type,
+        "sync_enabled": True,
+        "connected": True,
+        "last_sync": now_iso,
+        "created_at": now_iso,
+    }
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"{SUPABASE_URL}/rest/v1/user_devices",
+            headers={**SB_HEADERS, "Prefer": "return=representation"},
+            json=payload,
+        )
+    if r.status_code in (200, 201):
+        data = r.json()
+        return {"success": True, "device": data[0] if data else payload}
+    return {"success": False, "error": r.text}
+
+
+@app.delete("/app/devices/{device_id}")
+async def remove_device(device_id: str):
+    if not SUPABASE_URL:
+        return {"success": False}
+    async with httpx.AsyncClient() as client:
+        r = await client.delete(
+            f"{SUPABASE_URL}/rest/v1/user_devices?id=eq.{device_id}",
+            headers=SB_HEADERS,
+        )
+    return {"success": r.status_code in (200, 204)}
+
+
+@app.post("/app/devices/{device_id}/sync")
+async def sync_device(device_id: str):
+    if not SUPABASE_URL:
+        return {"success": False}
+    now_iso = datetime.now(timezone.utc).isoformat()
+    async with httpx.AsyncClient() as client:
+        r = await client.patch(
+            f"{SUPABASE_URL}/rest/v1/user_devices?id=eq.{device_id}",
+            headers=SB_HEADERS,
+            json={"last_sync": now_iso},
+        )
+    return {"success": r.status_code in (200, 204), "last_sync": now_iso}
