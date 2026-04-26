@@ -2007,3 +2007,134 @@ async def move_session(session_id: str, request: Request):
             json={"date": target_date},
         )
     return {"success": r.status_code in (200, 204)}
+
+
+# ─── ACTIVITIES (GPS) ─────────────────────────────────────────────────────────
+
+XP_PER_KM: dict = {"run": 10, "bike": 5, "swim": 15, "walk": 3, "other": 5}
+
+TSS_FACTORS: dict = {"run": 0.85, "bike": 0.75, "swim": 0.7, "walk": 0.5, "other": 0.6}
+
+
+def _activity_xp(sport: str, distance_m: float) -> int:
+    km = distance_m / 1000
+    return round(km * XP_PER_KM.get(sport, 5))
+
+
+def _activity_tss(sport: str, duration_sec: int) -> int:
+    duration_min = duration_sec / 60
+    return round(duration_min * TSS_FACTORS.get(sport, 0.7))
+
+
+@app.post("/app/activities")
+async def create_activity(request: Request):
+    body = await request.json()
+    user_id = body.get("user_id")
+    if not user_id or not SUPABASE_URL:
+        return {"success": False, "error": "missing user_id"}
+
+    sport = body.get("sport", "other")
+    duration_sec = body.get("duration_seconds", 0)
+    distance_m = body.get("distance_meters", 0)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    row = {
+        "user_id": user_id,
+        "sport": sport,
+        "started_at": now_iso,
+        "ended_at": now_iso,
+        "duration_seconds": duration_sec,
+        "distance_meters": distance_m,
+        "avg_pace": body.get("avg_pace"),
+        "avg_speed": body.get("avg_speed"),
+        "max_speed": body.get("max_speed"),
+        "elevation_gain": body.get("elevation_gain"),
+        "elevation_loss": body.get("elevation_loss"),
+        "gps_track": body.get("gps_track", []),
+        "splits": body.get("splits", []),
+        "notes": body.get("notes"),
+        "source": body.get("source", "pulse_gps"),
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    }
+
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"{SUPABASE_URL}/rest/v1/activities",
+            headers={**SB_HEADERS, "Prefer": "return=representation"},
+            json=row,
+        )
+
+    if r.status_code not in (200, 201):
+        return {"success": False, "error": r.text}
+
+    rows = r.json() if isinstance(r.json(), list) else []
+    activity_id = rows[0].get("id") if rows else None
+
+    xp_earned = _activity_xp(sport, distance_m)
+    tss = _activity_tss(sport, duration_sec)
+
+    # Award XP
+    if xp_earned > 0:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{BASE_URL}/app/gamification/award/{user_id}",
+                json={"xp": xp_earned, "reason": f"activity_{sport}"},
+                timeout=10,
+            )
+
+    # Auto-complete today's training session if matching discipline/date
+    date_today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    async with httpx.AsyncClient() as client:
+        r2 = await client.get(
+            f"{SUPABASE_URL}/rest/v1/training_sessions"
+            f"?user_id=eq.{user_id}&date=eq.{date_today}&discipline=eq.{sport}&completed=eq.false"
+            f"&select=id&limit=1",
+            headers=SB_HEADERS,
+        )
+    matched = r2.json() if r2.status_code == 200 and isinstance(r2.json(), list) else []
+    if matched:
+        session_id = matched[0]["id"]
+        async with httpx.AsyncClient() as client:
+            await client.patch(
+                f"{SUPABASE_URL}/rest/v1/training_sessions?id=eq.{session_id}&user_id=eq.{user_id}",
+                headers=SB_HEADERS,
+                json={"completed": True, "activity_id": activity_id},
+            )
+        xp_earned += 25  # bonus for matching session
+
+    return {"success": True, "activity_id": activity_id, "xp_earned": xp_earned, "tss": tss}
+
+
+@app.get("/app/activities/{user_id}")
+async def get_activities(user_id: str, limit: int = 20, offset: int = 0):
+    if not SUPABASE_URL:
+        return []
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/activities"
+            f"?user_id=eq.{user_id}&order=created_at.desc&limit={limit}&offset={offset}"
+            f"&select=id,sport,duration_seconds,distance_meters,avg_pace,avg_speed,elevation_gain,splits,notes,created_at,source",
+            headers=SB_HEADERS,
+        )
+    return r.json() if r.status_code == 200 and isinstance(r.json(), list) else []
+
+
+@app.put("/app/activities/{activity_id}")
+async def update_activity(activity_id: str, request: Request):
+    body = await request.json()
+    user_id = body.get("user_id")
+    if not user_id or not SUPABASE_URL:
+        return {"success": False, "error": "missing user_id"}
+
+    allowed = {"sport", "notes", "avg_pace", "avg_speed"}
+    updates = {k: v for k, v in body.items() if k in allowed}
+    updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    async with httpx.AsyncClient() as client:
+        r = await client.patch(
+            f"{SUPABASE_URL}/rest/v1/activities?id=eq.{activity_id}&user_id=eq.{user_id}",
+            headers=SB_HEADERS,
+            json=updates,
+        )
+    return {"success": r.status_code in (200, 204)}
