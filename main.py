@@ -1887,3 +1887,123 @@ async def get_race_modalities_by_category(category: str):
             headers=SB_HEADERS,
         )
     return r.json() if r.status_code == 200 and isinstance(r.json(), list) else []
+
+
+# ─── SESSION CRUD ─────────────────────────────────────────────────────────────
+
+def _estimate_tss(duration_min: int, discipline: str) -> int:
+    factors = {"swim": 0.7, "bike": 0.75, "run": 0.85, "gym": 0.6, "brick": 0.9, "rest": 0.0}
+    return round(duration_min * factors.get(discipline, 0.8))
+
+
+@app.put("/app/plan/session/{session_id}")
+async def update_session(session_id: str, request: Request):
+    body = await request.json()
+    user_id = body.get("user_id")
+    if not user_id or not SUPABASE_URL:
+        return {"success": False, "error": "missing user_id"}
+
+    allowed = {"discipline", "duration_min", "title", "description", "custom_notes", "custom_blocks"}
+    updates = {k: v for k, v in body.items() if k in allowed and v is not None}
+
+    if not updates:
+        return {"success": False, "error": "no fields to update"}
+
+    # Recalculate TSS when duration or discipline changes
+    if "duration_min" in updates or "discipline" in updates:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/training_sessions?id=eq.{session_id}&user_id=eq.{user_id}&select=discipline,duration_min",
+                headers=SB_HEADERS,
+            )
+        rows = r.json() if r.status_code == 200 and isinstance(r.json(), list) else []
+        if rows:
+            cur = rows[0]
+            discipline = updates.get("discipline", cur.get("discipline", "run"))
+            duration_min = updates.get("duration_min", cur.get("duration_min", 60))
+            updates["tss"] = _estimate_tss(duration_min, discipline)
+
+    updates["user_custom"] = True
+
+    async with httpx.AsyncClient() as client:
+        r = await client.patch(
+            f"{SUPABASE_URL}/rest/v1/training_sessions?id=eq.{session_id}&user_id=eq.{user_id}",
+            headers={**SB_HEADERS, "Prefer": "return=representation"},
+            json=updates,
+        )
+
+    if r.status_code in (200, 204):
+        rows = r.json() if isinstance(r.json(), list) else []
+        updated = rows[0] if rows else None
+        return {"success": True, "updated_session": updated, "new_tss": updated.get("tss") if updated else None}
+    return {"success": False, "error": r.text}
+
+
+@app.delete("/app/plan/session/{session_id}")
+async def delete_session(session_id: str, user_id: str):
+    if not SUPABASE_URL:
+        return {"success": False, "error": "no db"}
+    async with httpx.AsyncClient() as client:
+        r = await client.delete(
+            f"{SUPABASE_URL}/rest/v1/training_sessions?id=eq.{session_id}&user_id=eq.{user_id}",
+            headers=SB_HEADERS,
+        )
+    return {"success": r.status_code in (200, 204)}
+
+
+@app.post("/app/plan/session/{session_id}/duplicate")
+async def duplicate_session(session_id: str, request: Request):
+    body = await request.json()
+    user_id = body.get("user_id")
+    target_date = body.get("target_date")
+    if not user_id or not target_date or not SUPABASE_URL:
+        return {"success": False, "error": "missing fields"}
+
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/training_sessions?id=eq.{session_id}&user_id=eq.{user_id}&select=*",
+            headers=SB_HEADERS,
+        )
+    rows = r.json() if r.status_code == 200 and isinstance(r.json(), list) else []
+    if not rows:
+        return {"success": False, "error": "session not found"}
+
+    original = dict(rows[0])
+    original.pop("id", None)
+    original["date"] = target_date
+    original["completed"] = False
+    original["activity_id"] = None
+    original["rpe"] = None
+    original["notes"] = None
+    original["feeling"] = None
+    original["completion"] = None
+
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"{SUPABASE_URL}/rest/v1/training_sessions",
+            headers={**SB_HEADERS, "Prefer": "return=representation"},
+            json=original,
+        )
+
+    if r.status_code in (200, 201):
+        rows = r.json() if isinstance(r.json(), list) else []
+        new_session = rows[0] if rows else None
+        return {"success": True, "session": new_session}
+    return {"success": False, "error": r.text}
+
+
+@app.post("/app/plan/session/{session_id}/move")
+async def move_session(session_id: str, request: Request):
+    body = await request.json()
+    user_id = body.get("user_id")
+    target_date = body.get("target_date")
+    if not user_id or not target_date or not SUPABASE_URL:
+        return {"success": False, "error": "missing fields"}
+
+    async with httpx.AsyncClient() as client:
+        r = await client.patch(
+            f"{SUPABASE_URL}/rest/v1/training_sessions?id=eq.{session_id}&user_id=eq.{user_id}",
+            headers=SB_HEADERS,
+            json={"date": target_date},
+        )
+    return {"success": r.status_code in (200, 204)}
