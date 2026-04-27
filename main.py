@@ -2765,3 +2765,68 @@ async def get_personal_records(user_id: str):
 
     order = {"swim": 0, "bike": 1, "run": 2, "gym": 3, "brick": 4}
     return {"prs": sorted(prs, key=lambda x: order.get(x["discipline"], 5))}
+
+
+# ─── Gym Virtual Coach ────────────────────────────────────────────────────────
+
+@app.post("/app/gym/coach-message")
+async def gym_coach_message(request: Request):
+    """Generate a real-time coaching message during a gym set."""
+    body = await request.json()
+    exercise    = body.get("exercise_name", "ejercicio")
+    current_set = int(body.get("current_set", 1))
+    total_sets  = int(body.get("total_sets", 4))
+    reps        = body.get("reps", "10")
+    weight      = float(body.get("weight_kg", 0))
+    phase       = body.get("phase", "pre")   # pre | post_set | rest | finish
+    rpe         = int(body.get("rpe", 7))
+    history     = body.get("history_summary", "")
+
+    weight_str = f"{weight} kg" if weight > 0 else "peso corporal"
+
+    if phase == "pre":
+        prompt = (
+            f"El atleta va a hacer {exercise}. {total_sets} series de {reps} reps a {weight_str}. "
+            f"Da un mensaje motivacional muy corto (máx 2 frases) con el cue de técnica más importante para este ejercicio. "
+            f"Sin emojis. Habla de tú, segunda persona. Español."
+        )
+    elif phase == "post_set":
+        prompt = (
+            f"El atleta completó la serie {current_set} de {total_sets} de {exercise} a {weight_str}. "
+            f"RPE: {rpe}/10. {'Historial previo: ' + history if history else ''}"
+            f"Da feedback concreto de 1-2 frases sobre el esfuerzo y qué ajustar en la siguiente serie. "
+            f"Sin emojis. Segunda persona. Español."
+        )
+    elif phase == "rest":
+        prompt = (
+            f"El atleta descansa entre series de {exercise}. "
+            f"Da un tip de recuperación o de técnica para la próxima serie. Máx 1 frase. Sin emojis. Español."
+        )
+    else:  # finish
+        prompt = (
+            f"El atleta completó {total_sets} series de {exercise} a {weight_str}. "
+            f"RPE medio {rpe}/10. {'Progreso: ' + history if history else ''}"
+            f"Celébralo brevemente y da un tip de mejora para la próxima sesión. Máx 2 frases. Sin emojis. Español."
+        )
+
+    try:
+        import anthropic as _anthropic
+        ai_client = _anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        msg = ai_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=100,
+            system="Eres un coach de gimnasio experto para triatletas. Responde siempre en español, de forma breve y directa.",
+            messages=[{"role": "user", "content": prompt}],
+        )
+        message = msg.content[0].text.strip()
+    except Exception:
+        # Fallback messages
+        fallbacks = {
+            "pre":      f"Vamos con {exercise}. Activa el core y controla el tempo.",
+            "post_set": f"Serie {current_set} completada. {'Buen esfuerzo.' if rpe >= 7 else 'Puedes subir el peso.'}",
+            "rest":     "Respira profundo. Prepara la posición para la siguiente.",
+            "finish":   f"{exercise} completado. ¡Buen trabajo hoy!",
+        }
+        message = fallbacks.get(phase, "Sigue así.")
+
+    return {"message": message}
